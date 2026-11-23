@@ -233,14 +233,76 @@ pub fn initial_cursors(route_count: Int) -> List<Int>
   return l;
 }
 
+// 接続済みの上流へ要求を送り、応答全体を読む。空の Bytes は失敗（書き込み・読み取りの失敗、上限超過）。時間の制限は呼び出し側。
+fn converse(c: &mut TcpClient, wire: &Bytes, no_body: Bool, max_body: Int) -> Bytes
+  intent "接続済みの上流へ要求を書き込み、応答を（終わりが分かるまで、または切断まで）読む。失敗は空の Bytes"
+  requires 0 <= max_body
+  ensures none
+  effects net.client, task.suspend
+{
+  match c.write_all(&wire) {
+    Err(_) => {
+      return Bytes.new();
+    }
+    Ok(_) => {}
+  }
+  let mut buf = Bytes.new();
+  let mut head_seen = false;
+  let mut expect = 0 - 1;
+  let mut limit = max_body + 131072;
+  let mut done = false;
+  let mut bad = false;
+  while !done {
+    match c.read(16384) {
+      Err(_) => {
+        bad = true;
+        done = true;
+      }
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          done = true;
+        } else {
+          buf.extend(&chunk);
+          if buf.byte_len() > limit {
+            bad = true;
+            done = true;
+          } else {
+            if !head_seen {
+              if head_end(&buf, 0) >= 0 {
+                head_seen = true;
+                expect = expected_total(&buf, no_body);
+                if is_chunked(&buf) {
+                  limit = max_body * 7 + 131072;
+                }
+              } else {
+                if buf.byte_len() > head_limit() {
+                  bad = true;
+                  done = true;
+                }
+              }
+            }
+            if expect >= 0 && buf.byte_len() >= expect {
+              done = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  if bad {
+    return Bytes.new();
+  }
+  return buf;
+}
+
 // 上流へ送って応答全体を読む。空の Bytes は失敗（接続不可・時間切れ・読み取り失敗・上限超過）。
 fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, max_body: Int, connect_ms: Int, read_ms: Int) -> Bytes
-  intent "上流へ接続し（connect_ms 以内）、要求を送って応答を読む（接続後 read_ms 以内）。失敗は空の Bytes"
+  intent "上流へ接続し（connect_ms 以内）、要求を送って応答を読む（接続の成功後 read_ms 以内。接続の所要時間とは独立）。失敗は空の Bytes"
   requires 1 <= connect_ms && 1 <= read_ms
   ensures none
   effects clock, net.client, task.spawn, task.suspend
 {
-  // 全体の締め切りは connect_ms + read_ms。接続だけは内側の task.timeout で connect_ms に区切る。
+  // 外側の締め切り connect_ms + read_ms は上限。接続は connect_ms、接続後のやり取りは別に read_ms で区切る。
   let whole = task.timeout(connect_ms + read_ms, move || {
     let target = host.clone();
     let connected = task.timeout(connect_ms, move || net.connect(&target, port));
@@ -254,60 +316,10 @@ fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, max_body: Int, 
             return Bytes.new();
           }
           Ok(c0) => {
-            let mut c = c0;
-            match c.write_all(&wire) {
-              Err(_) => {
-                return Bytes.new();
-              }
-              Ok(_) => {}
-            }
-            let mut buf = Bytes.new();
-            let mut head_seen = false;
-            let mut expect = 0 - 1;
-            let mut limit = max_body + 131072;
-            let mut done = false;
-            let mut bad = false;
-            while !done {
-              match c.read(16384) {
-                Err(_) => {
-                  bad = true;
-                  done = true;
-                }
-                Ok(chunk) => {
-                  if chunk.byte_len() == 0 {
-                    done = true;
-                  } else {
-                    buf.extend(&chunk);
-                    if buf.byte_len() > limit {
-                      bad = true;
-                      done = true;
-                    } else {
-                      if !head_seen {
-                        if head_end(&buf, 0) >= 0 {
-                          head_seen = true;
-                          expect = expected_total(&buf, no_body);
-                          if is_chunked(&buf) {
-                            limit = max_body * 7 + 131072;
-                          }
-                        } else {
-                          if buf.byte_len() > head_limit() {
-                            bad = true;
-                            done = true;
-                          }
-                        }
-                      }
-                      if expect >= 0 && buf.byte_len() >= expect {
-                        done = true;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            if bad {
-              return Bytes.new();
-            }
-            return buf;
+            let mut conn = c0;
+            let w = wire.clone();
+            let talked = task.timeout(read_ms, move || converse(&mut conn, &w, no_body, max_body));
+            return talked.unwrap_or(Bytes.new());
           }
         }
       }

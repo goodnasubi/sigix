@@ -84,5 +84,5 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 SIGIL=/path/to/sigil ./test.sh
 ```
 
-`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 14 件。後者は python3 で上流を 2 台立てる）を順に実行する。
+`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 15 件。後者は python3 で上流を 2 台立てる）を順に実行する。
 CI は sigil の main コミットを固定してコンパイラをビルドし、同じ `test.sh` を実行する（`.github/workflows/ci.yml`）。

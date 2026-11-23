@@ -179,6 +179,18 @@ t1=$(date +%s.%N)
 py 'import sys; d=float(sys.argv[2])-float(sys.argv[1]); sys.exit(0 if 0.8 < d < 4.0 else 1)' "$t0" "$t1" || fail "時間切れの長さが想定外"
 ok "応答しない上流はタイムアウトで 502"
 
+# 接続が速く済んでも、使わなかった接続の枠は読み取りの期限に足されない（read_timeout_ms は接続後に独立して効く）
+SLOW_CONFIG='{"listen":"127.0.0.1:@SERVER@","connect_timeout_ms":20000,"read_timeout_ms":1000,"routes":[
+ {"prefix":"/api/","type":"proxy","backends":["127.0.0.1:'"$PA"'"]},
+ {"prefix":"/","type":"static","root":"'"$WORK"'/www"}]}'
+start_sigix "$SLOW_CONFIG"
+t0=$(date +%s.%N)
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$BASE/api/hang")"
+t1=$(date +%s.%N)
+[ "$code" = "502" ] || fail "接続の枠が大きくても応答しない上流は 502（実際 $code）"
+py 'import sys; d=float(sys.argv[2])-float(sys.argv[1]); sys.exit(0 if 0.8 < d < 4.0 else 1)' "$t0" "$t1" || fail "read_timeout_ms が接続の枠に引き伸ばされている"
+ok "read_timeout_ms は接続の所要時間と独立（connect 20000・read 1000 でも約 1 秒で 502）"
+
 # 3'. Host を転送先へ書き換える設定
 HOST_CONFIG='{"listen":"127.0.0.1:@SERVER@","routes":[
  {"prefix":"/api/","type":"proxy","host":"backend","backends":["127.0.0.1:'"$PA"'"]},
