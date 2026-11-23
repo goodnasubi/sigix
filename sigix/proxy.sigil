@@ -8,6 +8,7 @@ use sigix.headers.client_headers;
 use sigix.headers.hdr;
 use sigix.headers.upstream_headers;
 use sigix.respparse.Upstream;
+use sigix.respparse.chunked_done;
 use sigix.respparse.expected_total;
 use sigix.respparse.head_end;
 use sigix.respparse.head_limit;
@@ -250,6 +251,7 @@ fn converse(c: &mut TcpClient, wire: &Bytes, no_body: Bool, max_body: Int) -> By
   let mut head_seen = false;
   let mut expect = 0 - 1;
   let mut limit = max_body + 131072;
+  let mut chunked = false;
   let mut done = false;
   let mut bad = false;
   while !done {
@@ -272,6 +274,7 @@ fn converse(c: &mut TcpClient, wire: &Bytes, no_body: Bool, max_body: Int) -> By
                 head_seen = true;
                 expect = expected_total(&buf, no_body);
                 if is_chunked(&buf) {
+                  chunked = true;
                   limit = max_body * 7 + 131072;
                 }
               } else {
@@ -282,6 +285,9 @@ fn converse(c: &mut TcpClient, wire: &Bytes, no_body: Bool, max_body: Int) -> By
               }
             }
             if expect >= 0 && buf.byte_len() >= expect {
+              done = true;
+            }
+            if chunked && !done && chunked_done(&buf) {
               done = true;
             }
           }

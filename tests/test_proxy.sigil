@@ -18,6 +18,7 @@ use sigix.headers.upstream_headers;
 use sigix.proxy.build_request;
 use sigix.proxy.initial_cursors;
 use sigix.proxy.next_backend;
+use sigix.respparse.chunked_done;
 use sigix.respparse.parse_response;
 use sigix.routes.find_route;
 use sigix.routes.parse_settings;
@@ -258,6 +259,49 @@ pub fn run_response_tests() -> Bool
   }
   if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n", false, 100) != 0 - 1 {
     return fail(&"respparse: 先頭が終わっていないものは拒否");
+  }
+  return true;
+}
+
+fn done_of(wire: &String) -> Bool
+  intent "チャンク形式の応答が揃っているか"
+  requires none
+  ensures none
+  effects none
+{
+  return chunked_done(&wire.as_bytes());
+}
+
+pub fn run_chunk_done_tests() -> Bool
+  intent "チャンク形式の応答の終端の検出をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+  if !done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n") {
+    return fail(&"chunked_done: 終端チャンク");
+  }
+  if !done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") {
+    return fail(&"chunked_done: 空の本文");
+  }
+  if !done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n") {
+    return fail(&"chunked_done: トレーラーつき");
+  }
+  if done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n") {
+    return fail(&"chunked_done: 終端チャンクがまだ");
+  }
+  if done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n") {
+    return fail(&"chunked_done: 最後の空行がまだ");
+  }
+  if done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab\r\n\r\n") {
+    return fail(&"chunked_done: 本文の中の空行は終端ではない");
+  }
+  if done_of(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n") {
+    return fail(&"chunked_done: 先頭がまだ");
+  }
+  if head.byte_len() == 0 {
+    return false;
   }
   return true;
 }

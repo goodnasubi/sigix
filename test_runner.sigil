@@ -5,6 +5,7 @@ module test_runner
 use tests.test_config.run_config_tests;
 use tests.test_mime.run_mime_tests;
 use tests.test_proxy.run_allowlist_tests;
+use tests.test_proxy.run_chunk_done_tests;
 use tests.test_proxy.run_conditional_tests;
 use tests.test_proxy.run_forward_tests;
 use tests.test_proxy.run_header_tests;
@@ -52,6 +53,9 @@ pub fn main() -> Int
   }
   if !run_allowlist_tests() {
     return 11;
+  }
+  if !run_chunk_done_tests() {
+    return 12;
   }
   return 0;
 }

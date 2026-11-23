@@ -446,3 +446,21 @@ pub fn is_chunked(buf: &Bytes) -> Bool
   }
   return values_of(&parsed.headers, &"transfer-encoding").len() > 0;
 }
+
+// チャンク形式の応答が、終端チャンク（`0` の行）とトレーラー、最後の空行まで揃ったか。接続が閉じられなくても、
+// 揃った時点で読み取りを終えるために使う。毎回全体を調べると 2 次の時間になるので、末尾が空行（CRLF CRLF）のときだけ調べる。
+pub fn chunked_done(buf: &Bytes) -> Bool
+  intent "チャンク形式の応答の本文が、終端チャンクと最後の空行まで揃ったか（先頭が届いていなければ false）"
+  requires none
+  ensures none
+  effects none
+{
+  let he = head_end(&buf, 0);
+  if he < 0 || he > max_head() || buf.byte_len() < he + 5 {
+    return false;
+  }
+  if sub(&buf, buf.byte_len() - 4, buf.byte_len()) != crlf2() {
+    return false;
+  }
+  return decode_chunks(&sub(&buf, he, buf.byte_len()), buf.byte_len()).is_some();
+}

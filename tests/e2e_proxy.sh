@@ -123,6 +123,10 @@ ok "POST / PUT の本文（300000 バイトのバイナリ）が往復する"
 # チャンクの応答・上流のエラー状態・HEAD
 [ "$(curl -s "$BASE/api/chunked")" = "hello chunked world" ] || fail "チャンクの応答"
 [ "$(curl -s "$BASE/api/tinychunks" | wc -c)" = "200000" ] || fail "1 バイトずつのチャンク（枠が本文の 6 倍）で 502 になった"
+t0=$(date +%s.%N)
+[ "$(curl -s --max-time 10 "$BASE/api/noclose")" = "hello" ] || fail "終端チャンクが届いたのに、接続が閉じられるまで待って 502 になった"
+t1=$(date +%s.%N)
+py 'import sys; sys.exit(0 if float(sys.argv[2])-float(sys.argv[1]) < 1.0 else 1)' "$t0" "$t1" || fail "接続を閉じない上流への応答が遅い"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/notfound")" = "404" ] || fail "上流の 404 を中継する"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -I "$BASE/api/head")" = "200" ] || fail "HEAD"
 ok "チャンクの応答・上流の状態（404）・HEAD"

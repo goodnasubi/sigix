@@ -32,6 +32,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
             self.wfile.write(b"0\r\n\r\n")
             return
+        if path.endswith("/noclose"):
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            self.wfile.write(b"5\r\nhello\r\n0\r\n\r\n")
+            self.wfile.flush()
+            time.sleep(20)
+            return
         if path.endswith("/tinychunks"):
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
