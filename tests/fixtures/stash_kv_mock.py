@@ -112,6 +112,21 @@ def handle_client(sock):
                     resp_payload = struct.pack(">BB", 1, 1)
                     resp_frame = struct.pack(">I", len(resp_payload)) + resp_payload
                     sock.sendall(resp_frame)
+            elif op == 4:  # DELETE
+                if len(payload) < 4:
+                    break
+                (key_len,) = struct.unpack(">H", payload[2:4])
+                if len(payload) < 4 + key_len:
+                    break
+                key = payload[4 : 4 + key_len]
+                log_event(f"DELETE {key.decode(errors='replace')}")
+                with lock:
+                    if key in store:
+                        del store[key]
+                # Success (0x01)
+                resp_payload = struct.pack(">BB", 1, 1)
+                resp_frame = struct.pack(">I", len(resp_payload)) + resp_payload
+                sock.sendall(resp_frame)
             else:
                 break
     except Exception:

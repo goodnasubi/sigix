@@ -230,6 +230,44 @@ lp_code="$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/$long_path")"
 [ "$lp_code" = "200" ] || fail "長いキーの要求がオリジンで 200 にならなかった"
 ok "512 バイト超過キーの通過"
 
+# 6c. P2: 変更成功後のキャッシュ無効化
+# キャッシュヒットしている状態から POST/PUT/DELETE を送信し、次回 GET でオリジン再取得されることを検証
+m_get1="$(curl -s "$BASE/api/cacheable")"
+m_get2="$(curl -s "$BASE/api/cacheable")"
+[ "$m_get1" = "$m_get2" ] || fail "無効化前テストのキャッシュヒット失敗"
+
+# POST 送信で対象 URI を変更
+curl -s -X POST -o /dev/null "$BASE/api/cacheable"
+m_post_get="$(curl -s "$BASE/api/cacheable")"
+[ "$m_post_get" != "$m_get1" ] || fail "POST 成功後にキャッシュが無効化されていない"
+
+# PUT 送信で対象 URI を変更
+curl -s -X PUT -o /dev/null "$BASE/api/cacheable"
+m_put_get="$(curl -s "$BASE/api/cacheable")"
+[ "$m_put_get" != "$m_post_get" ] || fail "PUT 成功後にキャッシュが無効化されていない"
+
+# DELETE 送信で対象 URI を変更
+curl -s -X DELETE -o /dev/null "$BASE/api/cacheable"
+m_del_get="$(curl -s "$BASE/api/cacheable")"
+[ "$m_del_get" != "$m_put_get" ] || fail "DELETE 成功後にキャッシュが無効化されていない"
+ok "変更成功後（POST/PUT/DELETE）のキャッシュ無効化（P2）"
+
+# 6d. P2: 要求の鮮度制約の尊重
+# キャッシュヒットする状態を確立
+f_get1="$(curl -s "$BASE/api/cacheable")"
+f_get2="$(curl -s "$BASE/api/cacheable")"
+[ "$f_get1" = "$f_get2" ] || fail "鮮度制約前テストのキャッシュヒット失敗"
+
+# max-age=0 付き要求はキャッシュを迂回してオリジンへ到達
+f_zero="$(curl -s -H "Cache-Control: max-age=0" "$BASE/api/cacheable")"
+[ "$f_zero" != "$f_get1" ] || fail "Cache-Control: max-age=0 要求がキャッシュを迂回していない"
+ok "要求の max-age=0 によるキャッシュ迂回（P2）"
+
+# min-fresh=60 付き要求は残余鮮度不足（max-age: 2 < 60）のためキャッシュを迂回
+f_minfresh="$(curl -s -H "Cache-Control: min-fresh=60" "$BASE/api/cacheable")"
+[ "$f_minfresh" != "$f_zero" ] || fail "Cache-Control: min-fresh=60 要求がキャッシュを迂回していない"
+ok "要求の min-fresh 制約によるキャッシュ迂回（P2）"
+
 # 7. KV 障害時のフォールバック（オリジン利用継続）
 # stash-kv プロセスを終了させても、sigix はエラーにならずオリジンから正常応答する
 stash_pid="${PIDS[1]}"

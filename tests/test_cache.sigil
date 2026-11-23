@@ -3,14 +3,18 @@ module tests.test_cache
   trust none
 
 use sigix.cache.deserialize_cached_response;
+use sigix.cache.encode_stash_delete;
 use sigix.cache.encode_stash_get;
 use sigix.cache.encode_stash_put;
 use sigix.cache.extract_age;
+use sigix.cache.is_unsafe_method;
 use sigix.cache.make_cache_key;
+use sigix.cache.parse_request_cache_control;
 use sigix.cache.parse_stash_response;
 use sigix.cache.request_cache_key;
 use sigix.cache.request_cacheable;
 use sigix.cache.response_cacheable;
+use sigix.cache.response_freshness_lifetime;
 use sigix.cache.serialize_cached_response;
 use sigix.headers.hdr;
 use sigix.routes.parse_settings;
@@ -187,6 +191,48 @@ pub fn run_cache_request_tests() -> Bool
     }
   }
 
+  // P2: 要求の Cache-Control ディレクティブ（max-age, min-fresh）の解釈
+  let r_policy = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCache-Control: max-age=60, min-fresh=15", &Bytes.new());
+  match r_policy {
+    None => {
+      return fail(&"req_policy: 要求作成失敗");
+    }
+    Some(req) => {
+      let pol = parse_request_cache_control(&req);
+      if pol.max_age != Some(60) {
+        return fail(&"req_policy: max-age 解釈不一致 (期待 60)");
+      }
+      if pol.min_fresh != Some(15) {
+        return fail(&"req_policy: min-fresh 解釈不一致 (期待 15)");
+      }
+      if pol.no_store || pol.no_cache {
+        return fail(&"req_policy: no-store / no-cache が誤検知");
+      }
+    }
+  }
+
+  // P2: max-age=0 の解釈
+  let r_zero = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCache-Control: max-age=0", &Bytes.new());
+  match r_zero {
+    None => {
+      return fail(&"req_policy: max-age=0 要求作成失敗");
+    }
+    Some(req) => {
+      let pol_zero = parse_request_cache_control(&req);
+      if pol_zero.max_age != Some(0) {
+        return fail(&"req_policy: max-age=0 解釈不一致");
+      }
+    }
+  }
+
+  // P2: 非安全メソッド判定（is_unsafe_method）
+  if is_unsafe_method(&"GET") || is_unsafe_method(&"HEAD") || is_unsafe_method(&"OPTIONS") || is_unsafe_method(&"TRACE") {
+    return fail(&"is_unsafe_method: 安全メソッド（GET/HEAD/OPTIONS/TRACE）は false");
+  }
+  if !is_unsafe_method(&"POST") || !is_unsafe_method(&"PUT") || !is_unsafe_method(&"DELETE") || !is_unsafe_method(&"PATCH") {
+    return fail(&"is_unsafe_method: 変更メソッド（POST/PUT/DELETE/PATCH）は true");
+  }
+
   return true;
 }
 
@@ -349,6 +395,20 @@ pub fn run_cache_response_tests() -> Bool
     return fail(&"extract_age: Age ヘッダなしは 0（P2）");
   }
 
+  // P2: response_freshness_lifetime 単体確認
+  if response_freshness_lifetime(&h_smaxage_age, 60) != 100 {
+    return fail(&"response_freshness_lifetime: s-maxage 優先鮮度期間");
+  }
+  if response_freshness_lifetime(&h1, 60) != 120 {
+    return fail(&"response_freshness_lifetime: max-age 鮮度期間");
+  }
+  if response_freshness_lifetime(&h3, 60) != 60 {
+    return fail(&"response_freshness_lifetime: public デフォルト鮮度期間");
+  }
+  if response_freshness_lifetime(&h_priv, 60) != -1 {
+    return fail(&"response_freshness_lifetime: private は -1");
+  }
+
   return true;
 }
 
@@ -477,6 +537,12 @@ pub fn run_cache_stash_protocol_tests() -> Bool
         return fail(&"stash_proto: PUT フレーム長");
       }
     }
+  }
+
+  // P2: DELETE フレームは 4 (Length) + 1 (Ver=1) + 1 (Op=4) + 2 (key_len) + 11 (key) = 19 バイト
+  let del_frame = encode_stash_delete(&key);
+  if del_frame.byte_len() != 19 {
+    return fail(&"stash_proto: DELETE フレーム長不一致 (期待 19)");
   }
 
   // 応答解釈: Success (0x01)

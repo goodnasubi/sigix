@@ -5,6 +5,7 @@ module sigix.app
 use sigix.allowlist.is_trusted;
 use sigix.allowlist.normalize_peer;
 use sigix.cache.try_cache_get;
+use sigix.cache.try_cache_invalidate;
 use sigix.cache.try_cache_put;
 use sigix.headers.source;
 use sigix.proxy.forward;
@@ -104,6 +105,7 @@ pub fn handle(settings: &Settings, cursors: &Lock<List<Int>>, max_body: Int, pee
             let done = forward(&req, &src, &route, idx, &cursors, settings.connect_ms, settings.read_ms, max_body);
             if route.cache.is_some() {
               try_cache_put(&route, &req, &done.res);
+              try_cache_invalidate(&route, &req, done.res.status());
             }
             console.log(&log_line(&req, &done.res, &done.backend, done.upstream));
             return done.res;
