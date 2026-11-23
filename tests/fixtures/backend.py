@@ -32,6 +32,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
             self.wfile.write(b"0\r\n\r\n")
             return
+        if path.endswith("/tinychunks"):
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"".join(b"1\r\nx\r\n" for _ in range(200000)) + b"0\r\n\r\n")
+            return
         if path.endswith("/notfound"):
             out = b"nope"
             self.send_response(404)

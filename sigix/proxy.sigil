@@ -11,6 +11,7 @@ use sigix.respparse.Upstream;
 use sigix.respparse.expected_total;
 use sigix.respparse.head_end;
 use sigix.respparse.head_limit;
+use sigix.respparse.is_chunked;
 use sigix.respparse.parse_response;
 use sigix.routes.Backend;
 use sigix.routes.Route;
@@ -233,7 +234,7 @@ pub fn initial_cursors(route_count: Int) -> List<Int>
 }
 
 // 上流へ送って応答全体を読む。空の Bytes は失敗（接続不可・時間切れ・読み取り失敗・上限超過）。
-fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, limit: Int, connect_ms: Int, read_ms: Int) -> Bytes
+fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, max_body: Int, connect_ms: Int, read_ms: Int) -> Bytes
   intent "上流へ接続し（connect_ms 以内）、要求を送って応答を読む（接続後 read_ms 以内）。失敗は空の Bytes"
   requires 1 <= connect_ms && 1 <= read_ms
   ensures none
@@ -263,6 +264,7 @@ fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, limit: Int, con
             let mut buf = Bytes.new();
             let mut head_seen = false;
             let mut expect = 0 - 1;
+            let mut limit = max_body + 131072;
             let mut done = false;
             let mut bad = false;
             while !done {
@@ -284,6 +286,9 @@ fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, limit: Int, con
                         if head_end(&buf, 0) >= 0 {
                           head_seen = true;
                           expect = expected_total(&buf, no_body);
+                          if is_chunked(&buf) {
+                            limit = max_body * 7 + 131072;
+                          }
                         } else {
                           if buf.byte_len() > head_limit() {
                             bad = true;
@@ -356,8 +361,7 @@ pub fn forward(req: &HttpRequest, src: &Source, route: &Route, route_index: Int,
         }
         Some(wire) => {
           let no_body = req.method() == "HEAD";
-          let limit = max_body + 131072;
-          let buf = exchange(b.host.clone(), b.port, wire, no_body, limit, connect_ms, read_ms);
+          let buf = exchange(b.host.clone(), b.port, wire, no_body, max_body, connect_ms, read_ms);
           if buf.byte_len() == 0 {
             return Proxied { res: bad_gateway(), backend: name, upstream: 0 };
           }

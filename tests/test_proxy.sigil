@@ -233,6 +233,12 @@ pub fn run_response_tests() -> Bool
   if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\nx", false, 100) != 0 - 1 {
     return fail(&"respparse: 上限を超える Content-Length は拒否");
   }
+  if parsed_body(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n1\r\nb\r\n1\r\nc\r\n1\r\nd\r\n0\r\n\r\n", false, 4) != "abcd" {
+    return fail(&"respparse: 1 バイトずつのチャンクでも、復号後の本文が上限内なら受け入れる");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n1\r\nb\r\n0\r\n\r\n", false, 1) != 0 - 1 {
+    return fail(&"respparse: 復号後の本文が上限を超えるチャンクは拒否");
+  }
   if parsed_status(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n", false, 100) != 0 - 1 {
     return fail(&"respparse: 終わりのチャンクが無いものは拒否");
   }

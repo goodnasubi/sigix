@@ -427,3 +427,22 @@ pub fn expected_total(buf: &Bytes, no_body: Bool) -> Int
   }
   return he + cl;
 }
+
+// チャンク形式の応答か（先頭が届いていて Transfer-Encoding があるとき true）。枠のオーバーヘッド（最悪で本文 1 バイトにつき
+// 6 バイト）の分だけ、読み取りの上限を広げるために使う。復号後の本文の上限は `parse_response` が厳密に守る。
+pub fn is_chunked(buf: &Bytes) -> Bool
+  intent "先頭が届いていて、チャンク形式（Transfer-Encoding あり）の応答か"
+  requires none
+  ensures none
+  effects none
+{
+  let he = head_end(&buf, 0);
+  if he < 0 || he > max_head() {
+    return false;
+  }
+  let parsed = parse_head(&sub(&buf, 0, he - 4));
+  if parsed.status == 0 {
+    return false;
+  }
+  return values_of(&parsed.headers, &"transfer-encoding").len() > 0;
+}

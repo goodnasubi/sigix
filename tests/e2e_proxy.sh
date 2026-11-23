@@ -121,6 +121,7 @@ ok "POST / PUT の本文（300000 バイトのバイナリ）が往復する"
 
 # チャンクの応答・上流のエラー状態・HEAD
 [ "$(curl -s "$BASE/api/chunked")" = "hello chunked world" ] || fail "チャンクの応答"
+[ "$(curl -s "$BASE/api/tinychunks" | wc -c)" = "200000" ] || fail "1 バイトずつのチャンク（枠が本文の 6 倍）で 502 になった"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/notfound")" = "404" ] || fail "上流の 404 を中継する"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -I "$BASE/api/head")" = "200" ] || fail "HEAD"
 ok "チャンクの応答・上流の状態（404）・HEAD"
