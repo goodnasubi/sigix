@@ -268,6 +268,36 @@ f_minfresh="$(curl -s -H "Cache-Control: min-fresh=60" "$BASE/api/cacheable")"
 [ "$f_minfresh" != "$f_zero" ] || fail "Cache-Control: min-fresh=60 要求がキャッシュを迂回していない"
 ok "要求の min-fresh 制約によるキャッシュ迂回（P2）"
 
+# 6e. P2: Pragma: no-cache によるキャッシュ迂回（Cache-Control なし時）
+# キャッシュヒットする状態を確立
+pr_get1="$(curl -s "$BASE/api/cacheable")"
+pr_get2="$(curl -s "$BASE/api/cacheable")"
+[ "$pr_get1" = "$pr_get2" ] || fail "Pragma テスト前のキャッシュヒット失敗"
+
+# Pragma: no-cache（Cache-Control なし）でキャッシュを迂回
+pr_res="$(curl -s -H "Pragma: no-cache" "$BASE/api/cacheable")"
+[ "$pr_res" != "$pr_get1" ] || fail "Pragma: no-cache 要求がキャッシュを迂回していない"
+
+# Cache-Control がある場合は Pragma: no-cache を無視してキャッシュヒット
+pr_ignored="$(curl -s -H "Cache-Control: max-age=60" -H "Pragma: no-cache" "$BASE/api/cacheable")"
+[ "$pr_ignored" = "$pr_get1" ] || fail "Cache-Control 併記時に Pragma: no-cache が無視されていない"
+ok "Pragma: no-cache によるキャッシュ迂回と Cache-Control 優先（P2）"
+
+# 6f. P2: 条件付き要求（If-None-Match / If-Match）のキャッシュ迂回
+# キャッシュヒットする状態を確立
+cond_get1="$(curl -s "$BASE/api/cacheable")"
+cond_get2="$(curl -s "$BASE/api/cacheable")"
+[ "$cond_get1" = "$cond_get2" ] || fail "条件付き要求テスト前のキャッシュヒット失敗"
+
+# If-None-Match 付き要求はキャッシュ取得を迂回して上流へ転送
+inm_res="$(curl -s -H 'If-None-Match: "etag-abc"' "$BASE/api/cacheable")"
+[ "$inm_res" != "$cond_get1" ] || fail "If-None-Match 付き要求がキャッシュを迂回していない"
+
+# If-Match 付き要求はキャッシュ取得を迂回して上流へ転送
+im_res="$(curl -s -H 'If-Match: *' "$BASE/api/cacheable")"
+[ "$im_res" != "$inm_res" ] || fail "If-Match 付き要求がキャッシュを迂回していない"
+ok "条件付き要求（If-None-Match / If-Match）のキャッシュ迂回（P2）"
+
 # 7. KV 障害時のフォールバック（オリジン利用継続）
 # stash-kv プロセスを終了させても、sigix はエラーにならずオリジンから正常応答する
 stash_pid="${PIDS[1]}"

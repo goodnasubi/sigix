@@ -149,11 +149,13 @@ pub struct ReqCachePolicy {
 }
 
 pub fn parse_request_cache_control(req: &HttpRequest) -> ReqCachePolicy
-  intent "要求ヘッダから Cache-Control ディレクティブ（no-store, no-cache, max-age, min-fresh）を解釈する"
+  intent "要求ヘッダから Cache-Control ディレクティブ（no-store, no-cache, max-age, min-fresh）および Cache-Control なしの Pragma: no-cache を解釈する"
   requires none
   ensures none
   effects none
 {
+  let mut has_cache_control = false;
+  let mut pragma_no_cache = false;
   let mut no_store = false;
   let mut no_cache = false;
   let mut max_age = None;
@@ -164,7 +166,9 @@ pub fn parse_request_cache_control(req: &HttpRequest) -> ReqCachePolicy
     match all.get(i) {
       None => {}
       Some(h) => {
-        if lower_string(&h.name()) == "cache-control" {
+        let name = lower_string(&h.name());
+        if name == "cache-control" {
+          has_cache_control = true;
           let directives = split_commas(&h.value());
           let mut j = 0;
           while j < directives.len() {
@@ -225,10 +229,34 @@ pub fn parse_request_cache_control(req: &HttpRequest) -> ReqCachePolicy
             }
             j = j + 1;
           }
+        } else if name == "pragma" {
+          let directives = split_commas(&h.value());
+          let mut j = 0;
+          while j < directives.len() {
+            match directives.get(j) {
+              None => {}
+              Some(d) => {
+                let trimmed = trim_ows(&d);
+                let eq_idx = find_from(&trimmed, &"=".as_bytes(), 0);
+                let mut name_part = trimmed.clone();
+                if eq_idx >= 0 {
+                  name_part = trim_ows(&sub(&trimmed, 0, eq_idx));
+                }
+                let ld = lower_bytes(&name_part);
+                if eq_ignore_case(&ld, &"no-cache".as_bytes()) {
+                  pragma_no_cache = true;
+                }
+              }
+            }
+            j = j + 1;
+          }
         }
       }
     }
     i = i + 1;
+  }
+  if !has_cache_control && pragma_no_cache {
+    no_cache = true;
   }
   return ReqCachePolicy { no_store: no_store, no_cache: no_cache, max_age: max_age, min_fresh: min_fresh };
 }
@@ -813,10 +841,35 @@ pub fn extract_headers(res: &HttpResponse) -> List<Hdr>
   return out;
 }
 
+// 要求が条件付きヘッダ（If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since, If-Range）を含むか判定する。
+pub fn is_conditional_request(req: &HttpRequest) -> Bool
+  intent "要求が条件付きヘッダを含むか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let all = req.headers();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        let name = lower_string(&h.name());
+        if name == "if-match" || name == "if-none-match" || name == "if-modified-since" || name == "if-unmodified-since" || name == "if-range" {
+          return true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
 // 経路と要求から、キャッシュ取得を試みる（キャッシュ無効またはミス・鮮度制約未達・障害は None）。
 // 要求の max-age=0 は再検証不可のため保守的に迂回。max-age=N / min-fresh=M は現行 Age と照合。
+// 条件付き要求（If-Match / If-None-Match 等）も上流で判定させるためキャッシュ取得を迂回。
 pub fn try_cache_get(route: &Route, req: &HttpRequest) -> Option<HttpResponse>
-  intent "経路でキャッシュが有効なら取得を試みる。ミス・共有不可・鮮度制約未達・障害は None"
+  intent "経路でキャッシュが有効なら取得を試みる。ミス・共有不可・鮮度制約未達・条件付き要求・障害は None"
   requires none
   ensures none
   effects clock, net.client, task.spawn, task.suspend
@@ -831,6 +884,11 @@ pub fn try_cache_get(route: &Route, req: &HttpRequest) -> Option<HttpResponse>
     }
   }
   if !request_cacheable(&req) {
+    return None;
+  }
+  if is_conditional_request(&req) {
+    // 再検証が未実装のため、条件付き要求（If-Match / If-None-Match 等）は
+    // キャッシュ取得を迂回して上流へ転送し、上流による 304 / 412 判定を行わせる。
     return None;
   }
   let policy = parse_request_cache_control(&req);

@@ -7,6 +7,7 @@ use sigix.cache.encode_stash_delete;
 use sigix.cache.encode_stash_get;
 use sigix.cache.encode_stash_put;
 use sigix.cache.extract_age;
+use sigix.cache.is_conditional_request;
 use sigix.cache.is_unsafe_method;
 use sigix.cache.make_cache_key;
 use sigix.cache.parse_request_cache_control;
@@ -231,6 +232,89 @@ pub fn run_cache_request_tests() -> Bool
   }
   if !is_unsafe_method(&"POST") || !is_unsafe_method(&"PUT") || !is_unsafe_method(&"DELETE") || !is_unsafe_method(&"PATCH") {
     return fail(&"is_unsafe_method: 変更メソッド（POST/PUT/DELETE/PATCH）は true");
+  }
+
+  // P2: Cache-Control がなく Pragma: no-cache の要求はキャッシュ不可
+  let r_pragma = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nPragma: no-cache", &Bytes.new());
+  match r_pragma {
+    None => {
+      return fail(&"req_pragma: 要求作成失敗");
+    }
+    Some(req) => {
+      let pol_pragma = parse_request_cache_control(&req);
+      if !pol_pragma.no_cache {
+        return fail(&"req_pragma: Pragma: no-cache で no_cache が true にならない");
+      }
+      if request_cacheable(&req) {
+        return fail(&"req_pragma: Pragma: no-cache はキャッシュ不可");
+      }
+    }
+  }
+
+  // P2: Cache-Control がある場合は Pragma: no-cache を無視（RFC 9111 Section 5.4）
+  let r_pragma_cc = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCache-Control: max-age=60\r\nPragma: no-cache", &Bytes.new());
+  match r_pragma_cc {
+    None => {
+      return fail(&"req_pragma_cc: 要求作成失敗");
+    }
+    Some(req) => {
+      let pol_pragma_cc = parse_request_cache_control(&req);
+      if pol_pragma_cc.no_cache {
+        return fail(&"req_pragma_cc: Cache-Control 併記時に Pragma が無視されていない");
+      }
+      if !request_cacheable(&req) {
+        return fail(&"req_pragma_cc: Cache-Control: max-age=60 併記時はキャッシュ可");
+      }
+    }
+  }
+
+  // P2: 条件付き要求判定（is_conditional_request）
+  let r_if_none_match = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nIf-None-Match: \"etag-123\"", &Bytes.new());
+  match r_if_none_match {
+    None => {
+      return fail(&"is_conditional: If-None-Match 要求作成失敗");
+    }
+    Some(req) => {
+      if !is_conditional_request(&req) {
+        return fail(&"is_conditional: If-None-Match が検出されない");
+      }
+    }
+  }
+
+  let r_if_match = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nIf-Match: *", &Bytes.new());
+  match r_if_match {
+    None => {
+      return fail(&"is_conditional: If-Match 要求作成失敗");
+    }
+    Some(req) => {
+      if !is_conditional_request(&req) {
+        return fail(&"is_conditional: If-Match が検出されない");
+      }
+    }
+  }
+
+  let r_if_modified = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nIf-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT", &Bytes.new());
+  match r_if_modified {
+    None => {
+      return fail(&"is_conditional: If-Modified-Since 要求作成失敗");
+    }
+    Some(req) => {
+      if !is_conditional_request(&req) {
+        return fail(&"is_conditional: If-Modified-Since が検出されない");
+      }
+    }
+  }
+
+  let r_plain_get = make_request(&"GET", &"/data");
+  match r_plain_get {
+    None => {
+      return fail(&"is_conditional: プレーン GET 作成失敗");
+    }
+    Some(req) => {
+      if is_conditional_request(&req) {
+        return fail(&"is_conditional: 条件なし GET が条件付きと判定された");
+      }
+    }
   }
 
   return true;
