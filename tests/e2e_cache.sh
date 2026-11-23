@@ -146,6 +146,12 @@ ns2="$(curl -s -H "Cache-Control: no-store" "$BASE/api/cacheable")"
 [ "$ns1" != "$ns2" ] || fail "Cache-Control: no-store 要求がオリジンを通過していない"
 ok "Cache-Control: no-store 要求のキャッシュ通過"
 
+# 4c-2. P1: 引数付き Cache-Control: no-cache="x-foo"
+nc_arg1="$(curl -s -H 'Cache-Control: no-cache="x-foo"' "$BASE/api/cacheable")"
+nc_arg2="$(curl -s -H 'Cache-Control: no-cache="x-foo"' "$BASE/api/cacheable")"
+[ "$nc_arg1" != "$nc_arg2" ] || fail "Cache-Control: no-cache=\"x-foo\" 要求がオリジンを通過していない"
+ok "Cache-Control: no-cache 引数付き要求のキャッシュ通過（P1）"
+
 # 4d. POST メソッド
 p1="$(curl -s -X POST "$BASE/api/cacheable")"
 p2="$(curl -s -X POST "$BASE/api/cacheable")"
@@ -159,11 +165,23 @@ priv2="$(curl -s "$BASE/api/private")"
 [ "$priv1" != "$priv2" ] || fail "private 応答がキャッシュされてしまった"
 ok "private 応答の通過"
 
+# 5a-2. P1: 引数付き private="x-user-info"
+pq1="$(curl -s "$BASE/api/private-qual")"
+pq2="$(curl -s "$BASE/api/private-qual")"
+[ "$pq1" != "$pq2" ] || fail "private=\"x-user-info\" 応答がキャッシュされてしまった"
+ok "private=\"x-user-info\" 応答の通過（P1）"
+
 # 5b. no-store
 nostore1="$(curl -s "$BASE/api/no-store")"
 nostore2="$(curl -s "$BASE/api/no-store")"
 [ "$nostore1" != "$nostore2" ] || fail "no-store 応答がキャッシュされてしまった"
 ok "no-store 応答の通過"
+
+# 5b-2. P1: 引数付き no-cache="x-user-info"
+ncq1="$(curl -s "$BASE/api/no-cache-qual")"
+ncq2="$(curl -s "$BASE/api/no-cache-qual")"
+[ "$ncq1" != "$ncq2" ] || fail "no-cache=\"x-user-info\" 応答がキャッシュされてしまった"
+ok "no-cache=\"x-user-info\" 応答の通過（P1）"
 
 # 5c. Set-Cookie
 sc1="$(curl -s "$BASE/api/set-cookie")"
@@ -182,6 +200,21 @@ code1="$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/notfound")"
 code2="$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/notfound")"
 [ "$code1" = "404" ] && [ "$code2" = "404" ] || fail "404 応答の伝播失敗"
 ok "404 応答の通過"
+
+# 5f. P2: 既に stale（Age: 15, max-age: 10）な応答の通過
+stale1="$(curl -s "$BASE/api/age-stale")"
+stale2="$(curl -s "$BASE/api/age-stale")"
+[ "$stale1" != "$stale2" ] || fail "stale (Age: 15, max-age: 10) な応答がキャッシュされてしまった"
+ok "stale (Age > max-age) 応答の通過（P2）"
+
+# 5g. P2: Age: 2 と max-age: 10（残余鮮度 8 秒）のキャッシュ保存とヒット時の Age ヘッダ更新
+act1="$(curl -s "$BASE/api/age-active")"
+act2="$(curl -s "$BASE/api/age-active")"
+[ "$act1" = "$act2" ] || fail "残余鮮度のある応答がキャッシュヒットしなかった"
+age_hdr="$(curl -s -i "$BASE/api/age-active" | grep -i "^age:" | tr -d '\r' | awk '{print $2}')"
+[ -n "$age_hdr" ] || fail "キャッシュヒット応答に Age ヘッダが付与されていない"
+[ "$age_hdr" -ge 2 ] || fail "キャッシュヒット応答の Age ($age_hdr) が initial_age (2) 以上になっていない"
+ok "残余鮮度計算によるキャッシュ保存と Age ヘッダ更新（P2）"
 
 # 6. 上限超過
 # 6a. 応答サイズ上限超過（3072 バイト超）: クライアントへは正常に届くがキャッシュされない

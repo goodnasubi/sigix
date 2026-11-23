@@ -71,6 +71,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(out)
             return
 
+        if path_only.endswith("/private-qual"):
+            out = f"private-qual response count={cnt}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Cache-Control", "private=\"x-user-info\", max-age=60")
+            self.send_header("X-User-Info", "secret-token")
+            self.end_headers()
+            self.wfile.write(out)
+            return
+
+        if path_only.endswith("/no-cache-qual"):
+            out = f"no-cache-qual response count={cnt}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Cache-Control", "no-cache=\"x-user-info\", max-age=60")
+            self.send_header("X-User-Info", "secret-token")
+            self.end_headers()
+            self.wfile.write(out)
+            return
+
+        if path_only.endswith("/age-stale"):
+            out = f"age-stale response count={cnt}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Cache-Control", "max-age=10")
+            self.send_header("Age", "15")
+            self.end_headers()
+            self.wfile.write(out)
+            return
+
+        if path_only.endswith("/age-active"):
+            out = f"age-active response count={cnt}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Cache-Control", "max-age=10")
+            self.send_header("Age", "2")
+            self.end_headers()
+            self.wfile.write(out)
+            return
+
         if path_only.endswith("/no-store"):
             out = f"no-store response count={cnt}".encode()
             self.send_response(200)

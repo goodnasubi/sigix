@@ -5,6 +5,7 @@ module tests.test_cache
 use sigix.cache.deserialize_cached_response;
 use sigix.cache.encode_stash_get;
 use sigix.cache.encode_stash_put;
+use sigix.cache.extract_age;
 use sigix.cache.make_cache_key;
 use sigix.cache.parse_stash_response;
 use sigix.cache.request_cache_key;
@@ -173,11 +174,24 @@ pub fn run_cache_request_tests() -> Bool
     }
   }
 
+  // P1: 引数付き Cache-Control: no-cache="x-header" は不可
+  let r_nocache_arg = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCache-Control: no-cache=\"x-header\"", &Bytes.new());
+  match r_nocache_arg {
+    None => {
+      return fail(&"req_cacheable: no-cache 引数付き要求作成失敗");
+    }
+    Some(req) => {
+      if request_cacheable(&req) {
+        return fail(&"req_cacheable: Cache-Control: no-cache=\"x-header\" はキャッシュ不可");
+      }
+    }
+  }
+
   return true;
 }
 
 pub fn run_cache_response_tests() -> Bool
-  intent "応答のキャッシュ可否と TTL 決定のテスト"
+  intent "応答のキャッシュ可否と TTL 決定のテスト（P1 引数付きディレクティブ・P2 Age による残余鮮度計算を含む）"
   requires none
   ensures none
   effects console
@@ -236,6 +250,20 @@ pub fn run_cache_response_tests() -> Bool
     return fail(&"resp_cacheable: private はキャッシュ不可");
   }
 
+  // P1: 引数付き private="x-user-info" は不可
+  let mut h_priv_qual = List.new();
+  h_priv_qual.push(hdr(&"cache-control", &"private=\"x-user-info\", max-age=60".as_bytes()));
+  if response_cacheable(200, &h_priv_qual, 60) != None {
+    return fail(&"resp_cacheable: private=\"x-user-info\" はキャッシュ不可（P1）");
+  }
+
+  // P1: 引用符なし引数付き private=field は不可
+  let mut h_priv_bare = List.new();
+  h_priv_bare.push(hdr(&"cache-control", &"private=field, max-age=60".as_bytes()));
+  if response_cacheable(200, &h_priv_bare, 60) != None {
+    return fail(&"resp_cacheable: private=field はキャッシュ不可（P1）");
+  }
+
   // no-store は不可
   let mut h_ns = List.new();
   h_ns.push(hdr(&"cache-control", &"public, no-store, max-age=60".as_bytes()));
@@ -248,6 +276,20 @@ pub fn run_cache_response_tests() -> Bool
   h_nc.push(hdr(&"cache-control", &"public, no-cache, max-age=60".as_bytes()));
   if response_cacheable(200, &h_nc, 60) != None {
     return fail(&"resp_cacheable: no-cache はキャッシュ不可");
+  }
+
+  // P1: 引数付き no-cache="x-user-info" は不可
+  let mut h_nc_qual = List.new();
+  h_nc_qual.push(hdr(&"cache-control", &"no-cache=\"x-user-info\", max-age=60".as_bytes()));
+  if response_cacheable(200, &h_nc_qual, 60) != None {
+    return fail(&"resp_cacheable: no-cache=\"x-user-info\" はキャッシュ不可（P1）");
+  }
+
+  // P1: 引用符なし引数付き no-cache=field は不可
+  let mut h_nc_bare = List.new();
+  h_nc_bare.push(hdr(&"cache-control", &"no-cache=field, max-age=60".as_bytes()));
+  if response_cacheable(200, &h_nc_bare, 60) != None {
+    return fail(&"resp_cacheable: no-cache=field はキャッシュ不可（P1）");
   }
 
   // Cache-Control なしは不可
@@ -264,11 +306,54 @@ pub fn run_cache_response_tests() -> Bool
     return fail(&"resp_cacheable: TTL <= 0 はキャッシュ不可");
   }
 
+  // P2: Age: 59 と max-age=60 -> 残り TTL = 1 秒
+  let mut h_age59 = List.new();
+  h_age59.push(hdr(&"cache-control", &"max-age=60".as_bytes()));
+  h_age59.push(hdr(&"age", &"59".as_bytes()));
+  let ttl_age59 = response_cacheable(200, &h_age59, 60);
+  if ttl_age59 != Some(1) {
+    return fail(&"resp_cacheable: Age: 59 と max-age=60 で残り TTL=1（P2）");
+  }
+
+  // P2: Age: 120 と max-age=60（stale）-> キャッシュ不可（None）
+  let mut h_stale = List.new();
+  h_stale.push(hdr(&"cache-control", &"max-age=60".as_bytes()));
+  h_stale.push(hdr(&"age", &"120".as_bytes()));
+  if response_cacheable(200, &h_stale, 60) != None {
+    return fail(&"resp_cacheable: stale 応答 (Age > max-age) はキャッシュ不可（P2）");
+  }
+
+  // P2: Age: 60 と max-age=60（使い切り）-> キャッシュ不可（None）
+  let mut h_exact = List.new();
+  h_exact.push(hdr(&"cache-control", &"max-age=60".as_bytes()));
+  h_exact.push(hdr(&"age", &"60".as_bytes()));
+  if response_cacheable(200, &h_exact, 60) != None {
+    return fail(&"resp_cacheable: 鮮度期間終了 (Age == max-age) はキャッシュ不可（P2）");
+  }
+
+  // P2: Age: 10 と s-maxage=100 -> 残り TTL = 90
+  let mut h_smaxage_age = List.new();
+  h_smaxage_age.push(hdr(&"cache-control", &"s-maxage=100, max-age=60".as_bytes()));
+  h_smaxage_age.push(hdr(&"age", &"10".as_bytes()));
+  if response_cacheable(200, &h_smaxage_age, 60) != Some(90) {
+    return fail(&"resp_cacheable: Age を考慮した s-maxage 残余鮮度（P2）");
+  }
+
+  // P2: extract_age 単体確認
+  let mut h_age_trim = List.new();
+  h_age_trim.push(hdr(&"age", &"  42  ".as_bytes()));
+  if extract_age(&h_age_trim) != 42 {
+    return fail(&"extract_age: トリム付き Age 解釈（P2）");
+  }
+  if extract_age(&h1) != 0 {
+    return fail(&"extract_age: Age ヘッダなしは 0（P2）");
+  }
+
   return true;
 }
 
 pub fn run_cache_codec_tests() -> Bool
-  intent "HTTP 応答のバイナリ直列化・復元のテスト"
+  intent "HTTP 応答のバイナリ直列化・復元および Age ヘッダ更新のテスト"
   requires none
   ensures none
   effects console
@@ -278,13 +363,15 @@ pub fn run_cache_codec_tests() -> Bool
   hs.push(hdr(&"cache-control", &"public, max-age=300".as_bytes()));
   let body = "<h1>Cached Payload</h1>".as_bytes();
 
-  let encoded = serialize_cached_response(200, &hs, &body);
+  // cached_at = 1000, initial_age = 10 で直列化
+  let encoded = serialize_cached_response(200, &hs, &body, 1000, 10);
   match encoded {
     None => {
       return fail(&"codec: 直列化失敗");
     }
     Some(bytes) => {
-      let decoded = deserialize_cached_response(&bytes);
+      // now = 1005 (5秒経過): Age = 10 + 5 = 15
+      let decoded = deserialize_cached_response(&bytes, 1005);
       match decoded {
         None => {
           return fail(&"codec: 復元失敗");
@@ -299,6 +386,46 @@ pub fn run_cache_codec_tests() -> Bool
           if header_of(&res, &"content-type") != "text/html; charset=utf-8" {
             return fail(&"codec: 復元ヘッダ不一致");
           }
+          if header_of(&res, &"age") != "15" {
+            return fail(&"codec: 経過時間反映の Age 不一致 (期待 15)");
+          }
+        }
+      }
+
+      // now = 1000 (0秒経過): Age = 10 + 0 = 10
+      let decoded_immediate = deserialize_cached_response(&bytes, 1000);
+      match decoded_immediate {
+        None => {
+          return fail(&"codec: 即時復元失敗");
+        }
+        Some(res0) => {
+          if header_of(&res0, &"age") != "10" {
+            return fail(&"codec: 即時復元の Age 不一致 (期待 10)");
+          }
+        }
+      }
+    }
+  }
+
+  // 元から Age ヘッダを持つ応答を直列化しても、復元時に古い値が残らず単一の更新 Age になること
+  let mut hs_with_age = List.new();
+  hs_with_age.push(hdr(&"content-type", &"text/plain".as_bytes()));
+  hs_with_age.push(hdr(&"age", &"10".as_bytes()));
+  let enc_age = serialize_cached_response(200, &hs_with_age, &"hello".as_bytes(), 1000, 10);
+  match enc_age {
+    None => {
+      return fail(&"codec: Age 付き直列化失敗");
+    }
+    Some(b_age) => {
+      let dec = deserialize_cached_response(&b_age, 1007);
+      match dec {
+        None => {
+          return fail(&"codec: Age 付き復元失敗");
+        }
+        Some(res_age) => {
+          if header_of(&res_age, &"age") != "17" {
+            return fail(&"codec: 更新された単一の Age 不一致 (期待 17)");
+          }
         }
       }
     }
@@ -309,7 +436,7 @@ pub fn run_cache_codec_tests() -> Bool
   while big_body.byte_len() < 3100 {
     big_body.push(65);
   }
-  let big_encoded = serialize_cached_response(200, &hs, &big_body);
+  let big_encoded = serialize_cached_response(200, &hs, &big_body, 1000, 0);
   if big_encoded.is_some() {
     return fail(&"codec: 3072 バイト超の直列化は拒否");
   }
@@ -318,7 +445,7 @@ pub fn run_cache_codec_tests() -> Bool
   let mut broken = Bytes.new();
   broken.push(0);
   broken.push(200);
-  if deserialize_cached_response(&broken).is_some() {
+  if deserialize_cached_response(&broken, 1000).is_some() {
     return fail(&"codec: 不正バイナリ復元は None");
   }
 

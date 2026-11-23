@@ -88,9 +88,11 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 - `ttl_sec`: 応答の `Cache-Control` に明示的な `s-maxage` や `max-age` がなく `public` の場合に使う既定の TTL 秒数（1〜86400、既定値 60）。
 - **キャッシュキー**: `prefix + ":" + host + ":" + path + ("?" + query)`（上限 512 バイト）。
 - **キャッシュ可否の判定**:
-  - 要求: `GET` のみ。`Authorization` または `Cookie` がある要求、`Cache-Control: no-store` / `no-cache` を含む要求はキャッシュせず通過。
-  - 応答: 状態コード `200` のみ。`Set-Cookie` または `Vary` を含む応答、`Cache-Control: private` / `no-store` / `no-cache`、TTL が 0 以下のものはキャッシュせず通過。TTL は `s-maxage` > `max-age` > `ttl_sec`（`public` 指定時）の順。
+  - 要求: `GET` のみ。`Authorization` または `Cookie` がある要求、`Cache-Control: no-store` / `no-cache`（引数指定付きを含む）を含む要求はキャッシュせず通過。
+  - 応答: 状態コード `200` のみ。`Set-Cookie` または `Vary` を含む応答、`Cache-Control: private` / `no-store` / `no-cache`（引数指定付きを含む）はキャッシュせず通過。
+  - 有効期限: 応答の現行 `Age` を考慮し、残余鮮度（`s-maxage` > `max-age` > `ttl_sec` から `Age` を減算）を計算。残余鮮度が 0 以下の stale な応答はキャッシュせず通過。
   - 上限: 直列化後の応答サイズは 3072 バイト以下。超過時はキャッシュせず通過。
+- **キャッシュヒット時の Age 更新**: 保存時の時刻および初期 Age メタデータを保持し、キャッシュヒット応答には経過時間を反映した現行の `Age` ヘッダを付与して返却。
 - **フォールバック**: キャッシュミス、TTL 期限切れ、キー・値の上限超過、`sigil-stash-kv` の容量超過や接続・通信障害時は、安全にオリジンから取得してクライアントへ返す（クライアントへ 502 等のエラーを出さない）。
 - 静的配信経路（`type: "static"`）への `cache` 指定は設定エラーとなる（fail-closed）。
 
@@ -110,5 +112,5 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 SIGIL=/path/to/sigil ./test.sh
 ```
 
-`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 16 件、キャッシュ `tests/e2e_cache.sh` 15 件）を順に実行する。
+`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 16 件、キャッシュ `tests/e2e_cache.sh` 20 件）を順に実行する。
 CI は sigil の main コミットを固定してコンパイラをビルドし、同じ `test.sh` を実行する（`.github/workflows/ci.yml`）。

@@ -7,13 +7,15 @@ use sigix.headers.hdr;
 use sigix.headers.header_value;
 use sigix.routes.Route;
 use sigix.routes.cache_config;
+use sigix.text.decimal;
 use sigix.text.eq_ignore_case;
+use sigix.text.find_from;
 use sigix.text.lower_bytes;
 use sigix.text.lower_string;
 use sigix.text.parse_dec;
 use sigix.text.split_commas;
-use sigix.text.starts_with_at;
 use sigix.text.sub;
+use sigix.text.trim_ows;
 
 // ADR 0059 段 4: sigix の任意のキャッシュ連携（sigil-stash-kv 利用）。
 // 経路ごとにキャッシュを明示的に有効化し、共有を許可した公開 GET の応答だけを有限 TTL で保存する。
@@ -52,6 +54,70 @@ fn read_u16_be(data: &Bytes, offset: Int) -> Int
   return b0 * 256 + b1;
 }
 
+fn read_u32_be(data: &Bytes, offset: Int) -> Int
+  intent "32 ビット符号なしビッグエンディアン整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let b0 = data.get(offset).unwrap_or(0);
+  let b1 = data.get(offset + 1).unwrap_or(0);
+  let b2 = data.get(offset + 2).unwrap_or(0);
+  let b3 = data.get(offset + 3).unwrap_or(0);
+  return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
+}
+
+fn read_u64_be(data: &Bytes, offset: Int) -> Int
+  intent "64 ビット符号なしビッグエンディアン整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let hi = read_u32_be(&data, offset);
+  let lo = read_u32_be(&data, offset + 4);
+  return hi * 4294967296 + lo;
+}
+
+fn strip_quotes(b: &Bytes) -> Bytes
+  intent "前後の引用符（\"）を除去する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = b.byte_len();
+  if len >= 2 && b.get(0).unwrap_or(0) == 34 && b.get(len - 1).unwrap_or(0) == 34 {
+    return sub(&b, 1, len - 1);
+  }
+  return b.clone();
+}
+
+pub fn extract_age(headers: &List<Hdr>) -> Int
+  intent "応答ヘッダから Age の秒数を解釈する（無ければ 0）"
+  requires none
+  ensures none
+  effects none
+{
+  match header_value(&headers, &"age") {
+    None => {
+      return 0;
+    }
+    Some(val) => {
+      let trimmed = trim_ows(&val);
+      match parse_dec(&trimmed) {
+        None => {
+          return 0;
+        }
+        Some(a) => {
+          if a < 0 {
+            return 0;
+          }
+          return a;
+        }
+      }
+    }
+  }
+}
+
 // 要求から Host ヘッダの値を取り出す（無ければ空文字列）。小文字にそろえる。
 fn request_host(req: &HttpRequest) -> String
   intent "要求から Host ヘッダを取り出して小文字の文字列にする"
@@ -76,7 +142,7 @@ fn request_host(req: &HttpRequest) -> String
 }
 
 // 要求がキャッシュ可能か判定する。
-// GET のみ、Authorization なし、Cookie なし、Cache-Control に no-store/no-cache なし。
+// GET のみ、Authorization なし、Cookie なし、Cache-Control に no-store/no-cache（引数付き含む）なし。
 pub fn request_cacheable(req: &HttpRequest) -> Bool
   intent "要求がキャッシュ利用・保存の対象か判定する"
   requires none
@@ -103,7 +169,13 @@ pub fn request_cacheable(req: &HttpRequest) -> Bool
             match directives.get(j) {
               None => {}
               Some(d) => {
-                let ld = lower_bytes(&d);
+                let trimmed = trim_ows(&d);
+                let eq_idx = find_from(&trimmed, &"=".as_bytes(), 0);
+                let mut name_part = trimmed.clone();
+                if eq_idx >= 0 {
+                  name_part = trim_ows(&sub(&trimmed, 0, eq_idx));
+                }
+                let ld = lower_bytes(&name_part);
                 if eq_ignore_case(&ld, &"no-store".as_bytes()) || eq_ignore_case(&ld, &"no-cache".as_bytes()) {
                   return false;
                 }
@@ -119,11 +191,13 @@ pub fn request_cacheable(req: &HttpRequest) -> Bool
   return true;
 }
 
-// 応答ヘッダのリストから、Cache-Control の指示と TTL を解釈する。
+// 応答ヘッダのリストから、Cache-Control の指示と現行 Age を考慮して残り TTL を計算する。
 // 共有禁止（private / no-store / no-cache / Set-Cookie / Vary）なら None。
-// 共有可能なら Some(ttl_sec)（s-maxage > max-age > default_ttl）。
+// フィールド指定付きの private / no-cache（例: private="x-user-info"）も保守的に拒否（P1）。
+// 応答の現行 Age を考慮して残り鮮度期間（秒）を計算し、既に stale または使い切っていれば None（P2）。
+// 共有可能なら Some(remaining_ttl)（s-maxage > max-age > default_ttl から現行 Age を減算）。
 pub fn response_cacheable(status: Int, headers: &List<Hdr>, default_ttl: Int) -> Option<Int>
-  intent "応答が共有キャッシュに保存可能か判定し、有限 TTL（秒）を返す"
+  intent "応答が共有キャッシュに保存可能か判定し、残りの有効期間（秒）を返す。失効済み・共有不可は None"
   requires none
   ensures none
   effects none
@@ -152,23 +226,29 @@ pub fn response_cacheable(status: Int, headers: &List<Hdr>, default_ttl: Int) ->
             match parts.get(j) {
               None => {}
               Some(p) => {
-                let lp = lower_bytes(&p);
+                let trimmed = trim_ows(&p);
+                let eq_idx = find_from(&trimmed, &"=".as_bytes(), 0);
+                let mut name_part = trimmed.clone();
+                let mut arg_part = Bytes.new();
+                if eq_idx >= 0 {
+                  name_part = trim_ows(&sub(&trimmed, 0, eq_idx));
+                  arg_part = strip_quotes(&trim_ows(&sub(&trimmed, eq_idx + 1, trimmed.byte_len())));
+                }
+                let lp = lower_bytes(&name_part);
                 if eq_ignore_case(&lp, &"private".as_bytes()) || eq_ignore_case(&lp, &"no-store".as_bytes()) || eq_ignore_case(&lp, &"no-cache".as_bytes()) {
                   return None;
                 }
                 if eq_ignore_case(&lp, &"public".as_bytes()) {
                   is_public = true;
-                } else if starts_with_at(&lp, 0, &"s-maxage=".as_bytes()) {
-                  let val_b = sub(&lp, 9, lp.byte_len());
-                  match parse_dec(&val_b) {
+                } else if eq_ignore_case(&lp, &"s-maxage".as_bytes()) {
+                  match parse_dec(&arg_part) {
                     Some(sec) => {
                       s_maxage = sec;
                     }
                     None => {}
                   }
-                } else if starts_with_at(&lp, 0, &"max-age=".as_bytes()) {
-                  let val_b = sub(&lp, 8, lp.byte_len());
-                  match parse_dec(&val_b) {
+                } else if eq_ignore_case(&lp, &"max-age".as_bytes()) {
+                  match parse_dec(&arg_part) {
                     Some(sec) => {
                       max_age = sec;
                     }
@@ -184,18 +264,23 @@ pub fn response_cacheable(status: Int, headers: &List<Hdr>, default_ttl: Int) ->
     }
     i = i + 1;
   }
-  let mut ttl = -1;
+  let mut freshness = -1;
   if s_maxage >= 0 {
-    ttl = s_maxage;
+    freshness = s_maxage;
   } else if max_age >= 0 {
-    ttl = max_age;
+    freshness = max_age;
   } else if is_public {
-    ttl = default_ttl;
+    freshness = default_ttl;
   }
-  if ttl <= 0 {
+  if freshness <= 0 {
     return None;
   }
-  return Some(ttl);
+  let current_age = extract_age(&headers);
+  let remaining_ttl = freshness - current_age;
+  if remaining_ttl <= 0 {
+    return None;
+  }
+  return Some(remaining_ttl);
 }
 
 // キャッシュキーを組み立てる。
@@ -224,15 +309,17 @@ pub fn make_cache_key(prefix: &String, host: &String, path: &Bytes, query: &Byte
 }
 
 // HttpResponse の内容を stash-kv に保存するバイナリ値に直列化する。
-// 形式: status (u16 BE) + count (u16 BE) + [name_len (u16 BE) + name + val_len (u16 BE) + val]* + body
+// 形式: cached_at (u64 BE) + initial_age (u32 BE) + status (u16 BE) + count (u16 BE) + [name_len (u16 BE) + name + val_len (u16 BE) + val]* + body
 // 値長が 3072 バイトを超える場合は None（上限超過）。
-pub fn serialize_cached_response(status: Int, headers: &List<Hdr>, body: &Bytes) -> Option<Bytes>
+pub fn serialize_cached_response(status: Int, headers: &List<Hdr>, body: &Bytes, cached_at: Int, initial_age: Int) -> Option<Bytes>
   intent "応答を直列化する。3072 バイト超過は None"
   requires none
   ensures none
   effects none
 {
   let mut out = Bytes.new();
+  out.push_u64_be(cached_at);
+  out.push_u32_be(initial_age);
   out.push_u16_be(status);
   out.push_u16_be(headers.len());
   let mut i = 0;
@@ -256,20 +343,22 @@ pub fn serialize_cached_response(status: Int, headers: &List<Hdr>, body: &Bytes)
   return Some(out);
 }
 
-// 直列化されたバイナリ値から HttpResponse を復元する。
-pub fn deserialize_cached_response(data: &Bytes) -> Option<HttpResponse>
-  intent "直列化データから HttpResponse を復元する。形式不正は None"
+// 直列化されたバイナリ値から HttpResponse を復元し、現行の Age ヘッダを付与する。
+pub fn deserialize_cached_response(data: &Bytes, now: Int) -> Option<HttpResponse>
+  intent "直列化データから HttpResponse を復元し、経過時間を反映した Age を付与する。形式不正は None"
   requires none
   ensures none
   effects none
 {
   let len = data.byte_len();
-  if len < 4 {
+  if len < 16 {
     return None;
   }
-  let status = read_u16_be(&data, 0);
-  let count = read_u16_be(&data, 2);
-  let mut offset = 4;
+  let cached_at = read_u64_be(&data, 0);
+  let initial_age = read_u32_be(&data, 8);
+  let status = read_u16_be(&data, 12);
+  let count = read_u16_be(&data, 14);
+  let mut offset = 16;
   let mut hdrs = List.new();
   let mut i = 0;
   while i < count {
@@ -293,9 +382,17 @@ pub fn deserialize_cached_response(data: &Bytes) -> Option<HttpResponse>
     }
     let val_b = data.slice(offset, offset + vlen).unwrap_or(Bytes.new());
     offset = offset + vlen;
-    hdrs.push(hdr(&name_b.to_string_utf8().unwrap_or(""), &val_b));
+    let name_str = name_b.to_string_utf8().unwrap_or("");
+    if !eq_ignore_case(&name_b, &"age".as_bytes()) {
+      hdrs.push(hdr(&name_str, &val_b));
+    }
     i = i + 1;
   }
+  let mut delta = now - cached_at;
+  if delta < 0 {
+    delta = 0;
+  }
+  let current_age = initial_age + delta;
   let body = data.slice(offset, len).unwrap_or(Bytes.new());
   let mut res = HttpResponse.new(status, body);
   let mut k = 0;
@@ -308,6 +405,7 @@ pub fn deserialize_cached_response(data: &Bytes) -> Option<HttpResponse>
     }
     k = k + 1;
   }
+  res = res.with_header(&"age", &decimal(current_age));
   return Some(res);
 }
 
@@ -474,11 +572,12 @@ pub fn cache_get(host: &String, port: Int, key: &Bytes) -> Option<HttpResponse>
     }
   });
   let opt_payload = talk_res.unwrap_or(None);
+  let now = clock.unix_seconds().unwrap_or(0);
   return match opt_payload {
     None => None,
     Some(payload) => match parse_stash_response(&payload) {
       Ok(opt_val) => match opt_val {
-        Some(val) => deserialize_cached_response(&val),
+        Some(val) => deserialize_cached_response(&val, now),
         None => None,
       },
       Err(_) => None,
@@ -496,7 +595,9 @@ pub fn cache_put(host: &String, port: Int, key: &Bytes, res_status: Int, headers
 {
   let target = host.clone();
   let k = key.clone();
-  let val_opt = serialize_cached_response(res_status, &headers, &body);
+  let now = clock.unix_seconds().unwrap_or(0);
+  let initial_age = extract_age(&headers);
+  let val_opt = serialize_cached_response(res_status, &headers, &body, now, initial_age);
   if val_opt.is_none() {
     return false;
   }
