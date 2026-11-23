@@ -6,8 +6,8 @@ Sigil で書いた Web サーバ。段階 1（静的ファイル配信）を実�
 ## 使い方
 
 ```sh
-sigil build main.sigil -o sigix
-./sigix '[--listen,127.0.0.1:8080,--root,/srv/www]'
+sigil build main.sigil main -o sigix-server
+./sigix-server '[--listen,127.0.0.1:8080,--root,/srv/www]'
 ```
 
 Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つの角括弧リスト（`List<String>`）として渡す。
