@@ -432,6 +432,72 @@ pub fn run_routes_tests() -> Bool
   if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"localhost:9000\"]}]}") {
     return fail(&"routes: ホスト名の転送先は拒否（名前解決なし）");
   }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[2001:db8:::1]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [2001:db8:::1]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1::2::3]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [1::2::3]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[12345::1]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [12345::1]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1:2:3:4:5:6:7:8:9]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [1:2:3:4:5:6:7:8:9]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1:2:3:4:5:6:7]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [1:2:3:4:5:6:7]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[:1::2]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [:1::2]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1::2:]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [1::2:]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[::1.2.3]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [::1.2.3]:9000");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[::g]:9000\"]}]}") {
+    return fail(&"routes: 不正な IPv6 の転送先 [::g]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[::1]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [::1]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[2001:db8::1]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [2001:db8::1]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[::ffff:1.2.3.4]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [::ffff:1.2.3.4]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1:2:3:4:5:6:7:8]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [1:2:3:4:5:6:7:8]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1:2:3:4:5:6:1.2.3.4]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [1:2:3:4:5:6:1.2.3.4]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[::]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [::]:9000");
+  }
+  if !config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"[1::]:9000\"]}]}") {
+    return fail(&"routes: 正しい IPv6 の転送先 [1::]:9000");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"2001:db8:::1\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 不正な IPv6 の信頼する接続元 2001:db8:::1");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"1::2::3\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 不正な IPv6 の信頼する接続元 1::2::3");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"12345::1\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 不正な IPv6 の信頼する接続元 12345::1");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"1:2:3:4:5:6:7:8:9\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 不正な IPv6 の信頼する接続元 1:2:3:4:5:6:7:8:9");
+  }
+  if !config_ok(&"{\"trusted_proxies\":[\"::1\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 正しい IPv6 の信頼する接続元 ::1");
+  }
+  if !config_ok(&"{\"trusted_proxies\":[\"2001:db8::1\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 正しい IPv6 の信頼する接続元 2001:db8::1");
+  }
   if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[]}]}") {
     return fail(&"routes: 転送先が空");
   }

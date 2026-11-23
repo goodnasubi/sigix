@@ -130,33 +130,104 @@ fn ipv4_ok(s: &String) -> Bool
   return true;
 }
 
+fn hextet_ok(g: &Bytes) -> Bool
+  intent "IPv6 のグループとして正しいか（16 進 1〜4 桁）"
+  requires none
+  ensures none
+  effects none
+{
+  if g.byte_len() < 1 || g.byte_len() > 4 {
+    return false;
+  }
+  let mut i = 0;
+  while i < g.byte_len() {
+    let c = g.get(i).unwrap_or(0);
+    let digit = c >= 48 && c <= 57;
+    let lower = c >= 97 && c <= 102;
+    let upper = c >= 65 && c <= 70;
+    if !digit && !lower && !upper {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn has_dot(g: &Bytes) -> Bool
+  intent "ドット（0x2e）を含むか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < g.byte_len() {
+    if g.get(i).unwrap_or(0) == 46 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
 fn ipv6_ok(s: &String) -> Bool
-  intent "IPv6 数値アドレスらしいか（16 進・コロン・ドットだけで、コロンが 2 つ以上）"
+  intent "IPv6 数値アドレスとして正しいか（グループは 16 進 1〜4 桁、`::` は高々 1 回で `:::` は不可、`::` なしは 8 グループ、ありは 7 以下、末尾の IPv4 は 2 グループ分）"
   requires none
   ensures none
   effects none
 {
   let b = s.as_bytes();
-  if b.byte_len() < 2 || b.byte_len() > 45 {
+  let n = b.byte_len();
+  if n < 2 || n > 45 {
     return false;
   }
-  let mut colons = 0;
+  // `::` の個数（`:::` は 2 個と数えて弾く）と、単独のコロンで始まる・終わる形
+  let mut dc = 0;
   let mut i = 0;
-  while i < b.byte_len() {
-    let c = b.get(i).unwrap_or(0);
-    if c == 58 {
-      colons = colons + 1;
-    } else {
-      let digit = c >= 48 && c <= 57;
-      let lower = c >= 97 && c <= 102;
-      let upper = c >= 65 && c <= 70;
-      if !digit && !lower && !upper && c != 46 {
-        return false;
-      }
+  while i + 1 < n {
+    if b.get(i).unwrap_or(0) == 58 && b.get(i + 1).unwrap_or(0) == 58 {
+      dc = dc + 1;
     }
     i = i + 1;
   }
-  return colons >= 2;
+  if dc > 1 {
+    return false;
+  }
+  if b.get(0).unwrap_or(0) == 58 && b.get(1).unwrap_or(0) != 58 {
+    return false;
+  }
+  if b.get(n - 1).unwrap_or(0) == 58 && b.get(n - 2).unwrap_or(0) != 58 {
+    return false;
+  }
+  let parts = split_on(&b, 58);
+  let last = parts.len() - 1;
+  let mut groups = 0;
+  let mut k = 0;
+  while k < parts.len() {
+    let g = match parts.get(k) {
+      Some(p) => p.clone(),
+      None => Bytes.new(),
+    };
+    if g.byte_len() > 0 {
+      if k == last && has_dot(&g) {
+        if !ipv4_ok(&g.to_string_utf8().unwrap_or("")) {
+          return false;
+        }
+        groups = groups + 2;
+      } else {
+        if !hextet_ok(&g) {
+          return false;
+        }
+        groups = groups + 1;
+      }
+    } else if dc == 0 {
+      return false;
+    }
+    k = k + 1;
+  }
+  if dc == 1 {
+    return groups <= 7;
+  }
+  return groups == 8;
 }
 
 fn ip_ok(s: &String) -> Bool
