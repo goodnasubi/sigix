@@ -52,4 +52,7 @@ $SIGIL build --root . main.sigil main -o "$TMP_DIR/sigix"
 echo "=== 6. Running reverse proxy end-to-end tests ==="
 ./tests/e2e_proxy.sh "$TMP_DIR/sigix"
 
+echo "=== 7. Running cache integration tests ==="
+./tests/e2e_cache.sh "$TMP_DIR/sigix"
+
 echo "=== All tests passed successfully! Evaluator and native match verified. ==="

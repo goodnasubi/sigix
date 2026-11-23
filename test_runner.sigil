@@ -2,6 +2,12 @@ module test_runner
   targets server
   trust none
 
+use tests.test_cache.run_cache_codec_tests;
+use tests.test_cache.run_cache_key_tests;
+use tests.test_cache.run_cache_request_tests;
+use tests.test_cache.run_cache_response_tests;
+use tests.test_cache.run_cache_routes_config_tests;
+use tests.test_cache.run_cache_stash_protocol_tests;
 use tests.test_config.run_config_tests;
 use tests.test_mime.run_mime_tests;
 use tests.test_proxy.run_allowlist_tests;
@@ -56,6 +62,24 @@ pub fn main() -> Int
   }
   if !run_chunk_done_tests() {
     return 12;
+  }
+  if !run_cache_key_tests() {
+    return 13;
+  }
+  if !run_cache_request_tests() {
+    return 14;
+  }
+  if !run_cache_response_tests() {
+    return 15;
+  }
+  if !run_cache_codec_tests() {
+    return 16;
+  }
+  if !run_cache_stash_protocol_tests() {
+    return 17;
+  }
+  if !run_cache_routes_config_tests() {
+    return 18;
   }
   return 0;
 }

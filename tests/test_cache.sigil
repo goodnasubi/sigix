@@ -1,0 +1,537 @@
+module tests.test_cache
+  targets server
+  trust none
+
+use sigix.cache.deserialize_cached_response;
+use sigix.cache.encode_stash_get;
+use sigix.cache.encode_stash_put;
+use sigix.cache.make_cache_key;
+use sigix.cache.parse_stash_response;
+use sigix.cache.request_cache_key;
+use sigix.cache.request_cacheable;
+use sigix.cache.response_cacheable;
+use sigix.cache.serialize_cached_response;
+use sigix.headers.hdr;
+use sigix.routes.parse_settings;
+use tests.support.body_text;
+use tests.support.fail;
+use tests.support.header_of;
+use tests.support.make_raw_request;
+use tests.support.make_request;
+
+fn check_key(prefix: &String, host: &String, path: &String, query: &String) -> String
+  intent "make_cache_key の結果を文字列で返す（None なら空文字列）"
+  requires none
+  ensures none
+  effects none
+{
+  let k = make_cache_key(&prefix, &host, &path.as_bytes(), &query.as_bytes());
+  return match k {
+    Some(b) => b.to_string_utf8().unwrap_or(""),
+    None => "",
+  };
+}
+
+pub fn run_cache_key_tests() -> Bool
+  intent "キャッシュキー生成規則と上限のテスト"
+  requires none
+  ensures none
+  effects console
+{
+  let k1 = check_key(&"/api/", &"api.example.com", &"/api/items", &"");
+  if k1 != "/api/:api.example.com:/api/items" {
+    return fail(&"cache_key: クエリなしの形式");
+  }
+
+  let k2 = check_key(&"/api/", &"api.example.com", &"/api/items", &"page=1&sort=asc");
+  if k2 != "/api/:api.example.com:/api/items?page=1&sort=asc" {
+    return fail(&"cache_key: クエリありの形式");
+  }
+
+  // ポート番号付きホスト（小文字化されポートも保持）
+  let req_opt = make_raw_request(&"GET /api/v1/test HTTP/1.1\r\nHost: API.Example.COM:8443", &Bytes.new());
+  match req_opt {
+    None => {
+      return fail(&"cache_key: 要求作成失敗");
+    }
+    Some(req) => {
+      let rk = request_cache_key(&"/api/v1/", &req);
+      let s = match rk {
+        Some(b) => b.to_string_utf8().unwrap_or(""),
+        None => "",
+      };
+      if s != "/api/v1/:api.example.com:8443:/api/v1/test" {
+        return fail(&"cache_key: ホストの小文字化");
+      }
+    }
+  }
+
+  // 512 バイトちょうどのキーは成功
+  let mut long_p = Bytes.new();
+  while long_p.byte_len() < 480 {
+    long_p.push(97);
+  }
+  let k_fit = make_cache_key(&"/", &"h", &long_p, &Bytes.new());
+  if k_fit.is_none() {
+    return fail(&"cache_key: 512 バイト以下は許可");
+  }
+
+  // 513 バイトを超えるキーは None
+  let mut too_long = Bytes.new();
+  while too_long.byte_len() < 520 {
+    too_long.push(98);
+  }
+  let k_too_long = make_cache_key(&"/", &"h", &too_long, &Bytes.new());
+  if k_too_long.is_some() {
+    return fail(&"cache_key: 512 バイト超は拒否");
+  }
+
+  return true;
+}
+
+pub fn run_cache_request_tests() -> Bool
+  intent "要求のキャッシュ可否判定テスト"
+  requires none
+  ensures none
+  effects console
+{
+  // 正常な GET 要求
+  let r_get = make_request(&"GET", &"/data");
+  match r_get {
+    None => {
+      return fail(&"req_cacheable: GET 要求作成失敗");
+    }
+    Some(req) => {
+      if !request_cacheable(&req) {
+        return fail(&"req_cacheable: プレーンな GET はキャッシュ可");
+      }
+    }
+  }
+
+  // POST 要求は不可
+  let r_post = make_request(&"POST", &"/data");
+  match r_post {
+    None => {
+      return fail(&"req_cacheable: POST 要求作成失敗");
+    }
+    Some(req) => {
+      if request_cacheable(&req) {
+        return fail(&"req_cacheable: POST はキャッシュ不可");
+      }
+    }
+  }
+
+  // Authorization 付き GET は不可
+  let r_auth = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer xyz", &Bytes.new());
+  match r_auth {
+    None => {
+      return fail(&"req_cacheable: Auth 要求作成失敗");
+    }
+    Some(req) => {
+      if request_cacheable(&req) {
+        return fail(&"req_cacheable: Authorization 付きはキャッシュ不可");
+      }
+    }
+  }
+
+  // Cookie 付き GET は不可
+  let r_cookie = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCookie: session=123", &Bytes.new());
+  match r_cookie {
+    None => {
+      return fail(&"req_cacheable: Cookie 要求作成失敗");
+    }
+    Some(req) => {
+      if request_cacheable(&req) {
+        return fail(&"req_cacheable: Cookie 付きはキャッシュ不可");
+      }
+    }
+  }
+
+  // Cache-Control: no-store は不可
+  let r_nostore = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCache-Control: no-store", &Bytes.new());
+  match r_nostore {
+    None => {
+      return fail(&"req_cacheable: no-store 要求作成失敗");
+    }
+    Some(req) => {
+      if request_cacheable(&req) {
+        return fail(&"req_cacheable: Cache-Control: no-store はキャッシュ不可");
+      }
+    }
+  }
+
+  // Cache-Control: no-cache は不可
+  let r_nocache = make_raw_request(&"GET /data HTTP/1.1\r\nHost: example.com\r\nCache-Control: max-age=100, no-cache", &Bytes.new());
+  match r_nocache {
+    None => {
+      return fail(&"req_cacheable: no-cache 要求作成失敗");
+    }
+    Some(req) => {
+      if request_cacheable(&req) {
+        return fail(&"req_cacheable: Cache-Control: no-cache はキャッシュ不可");
+      }
+    }
+  }
+
+  return true;
+}
+
+pub fn run_cache_response_tests() -> Bool
+  intent "応答のキャッシュ可否と TTL 決定のテスト"
+  requires none
+  ensures none
+  effects console
+{
+  // 200 OK + max-age=120
+  let mut h1 = List.new();
+  h1.push(hdr(&"cache-control", &"max-age=120".as_bytes()));
+  h1.push(hdr(&"content-type", &"text/plain".as_bytes()));
+  let ttl1 = response_cacheable(200, &h1, 60);
+  if ttl1 != Some(120) {
+    return fail(&"resp_cacheable: max-age=120 の TTL");
+  }
+
+  // 200 OK + public, s-maxage=300, max-age=120 -> s-maxage が優先
+  let mut h2 = List.new();
+  h2.push(hdr(&"cache-control", &"public, max-age=120, s-maxage=300".as_bytes()));
+  let ttl2 = response_cacheable(200, &h2, 60);
+  if ttl2 != Some(300) {
+    return fail(&"resp_cacheable: s-maxage 優先");
+  }
+
+  // 200 OK + public (max-age なし) -> default_ttl が適用
+  let mut h3 = List.new();
+  h3.push(hdr(&"cache-control", &"public".as_bytes()));
+  let ttl3 = response_cacheable(200, &h3, 60);
+  if ttl3 != Some(60) {
+    return fail(&"resp_cacheable: public 単体でデフォルト TTL");
+  }
+
+  // 404 Not Found は不可
+  let ttl4 = response_cacheable(404, &h1, 60);
+  if ttl4 != None {
+    return fail(&"resp_cacheable: 200 以外はキャッシュ不可");
+  }
+
+  // Set-Cookie ありは不可
+  let mut h_cookie = List.new();
+  h_cookie.push(hdr(&"cache-control", &"public, max-age=60".as_bytes()));
+  h_cookie.push(hdr(&"set-cookie", &"sid=123".as_bytes()));
+  if response_cacheable(200, &h_cookie, 60) != None {
+    return fail(&"resp_cacheable: Set-Cookie ありはキャッシュ不可");
+  }
+
+  // Vary ありは不可
+  let mut h_vary = List.new();
+  h_vary.push(hdr(&"cache-control", &"public, max-age=60".as_bytes()));
+  h_vary.push(hdr(&"vary", &"Accept-Encoding".as_bytes()));
+  if response_cacheable(200, &h_vary, 60) != None {
+    return fail(&"resp_cacheable: Vary ありはキャッシュ不可");
+  }
+
+  // private は不可
+  let mut h_priv = List.new();
+  h_priv.push(hdr(&"cache-control", &"private, max-age=60".as_bytes()));
+  if response_cacheable(200, &h_priv, 60) != None {
+    return fail(&"resp_cacheable: private はキャッシュ不可");
+  }
+
+  // no-store は不可
+  let mut h_ns = List.new();
+  h_ns.push(hdr(&"cache-control", &"public, no-store, max-age=60".as_bytes()));
+  if response_cacheable(200, &h_ns, 60) != None {
+    return fail(&"resp_cacheable: no-store はキャッシュ不可");
+  }
+
+  // no-cache は不可
+  let mut h_nc = List.new();
+  h_nc.push(hdr(&"cache-control", &"public, no-cache, max-age=60".as_bytes()));
+  if response_cacheable(200, &h_nc, 60) != None {
+    return fail(&"resp_cacheable: no-cache はキャッシュ不可");
+  }
+
+  // Cache-Control なしは不可
+  let mut h_none = List.new();
+  h_none.push(hdr(&"content-type", &"text/plain".as_bytes()));
+  if response_cacheable(200, &h_none, 60) != None {
+    return fail(&"resp_cacheable: Cache-Control なしはキャッシュ不可");
+  }
+
+  // s-maxage=0 は TTL <= 0 のため不可
+  let mut h_zero = List.new();
+  h_zero.push(hdr(&"cache-control", &"public, s-maxage=0".as_bytes()));
+  if response_cacheable(200, &h_zero, 60) != None {
+    return fail(&"resp_cacheable: TTL <= 0 はキャッシュ不可");
+  }
+
+  return true;
+}
+
+pub fn run_cache_codec_tests() -> Bool
+  intent "HTTP 応答のバイナリ直列化・復元のテスト"
+  requires none
+  ensures none
+  effects console
+{
+  let mut hs = List.new();
+  hs.push(hdr(&"content-type", &"text/html; charset=utf-8".as_bytes()));
+  hs.push(hdr(&"cache-control", &"public, max-age=300".as_bytes()));
+  let body = "<h1>Cached Payload</h1>".as_bytes();
+
+  let encoded = serialize_cached_response(200, &hs, &body);
+  match encoded {
+    None => {
+      return fail(&"codec: 直列化失敗");
+    }
+    Some(bytes) => {
+      let decoded = deserialize_cached_response(&bytes);
+      match decoded {
+        None => {
+          return fail(&"codec: 復元失敗");
+        }
+        Some(res) => {
+          if res.status() != 200 {
+            return fail(&"codec: 復元状態コード不一致");
+          }
+          if body_text(&res) != "<h1>Cached Payload</h1>" {
+            return fail(&"codec: 復元本文不一致");
+          }
+          if header_of(&res, &"content-type") != "text/html; charset=utf-8" {
+            return fail(&"codec: 復元ヘッダ不一致");
+          }
+        }
+      }
+    }
+  }
+
+  // 3072 バイト超の値は直列化で拒否（None）
+  let mut big_body = Bytes.new();
+  while big_body.byte_len() < 3100 {
+    big_body.push(65);
+  }
+  let big_encoded = serialize_cached_response(200, &hs, &big_body);
+  if big_encoded.is_some() {
+    return fail(&"codec: 3072 バイト超の直列化は拒否");
+  }
+
+  // 壊れたバイナリの復元は None
+  let mut broken = Bytes.new();
+  broken.push(0);
+  broken.push(200);
+  if deserialize_cached_response(&broken).is_some() {
+    return fail(&"codec: 不正バイナリ復元は None");
+  }
+
+  return true;
+}
+
+pub fn run_cache_stash_protocol_tests() -> Bool
+  intent "sigil-stash-kv プロトコル電文（GET/PUT）の組み立てと解釈テスト"
+  requires none
+  ensures none
+  effects console
+{
+  let key = "cache:key:1".as_bytes();
+  let get_frame = encode_stash_get(&key);
+  // GET フレームは 4 (Length) + 1 (Ver=1) + 1 (Op=2) + 2 (key_len) + 11 (key) = 19 バイト
+  if get_frame.byte_len() != 19 {
+    return fail(&"stash_proto: GET フレーム長");
+  }
+
+  let val = "cached-data".as_bytes();
+  let put_frame = encode_stash_put(&key, &val, 60);
+  match put_frame {
+    None => {
+      return fail(&"stash_proto: PUT フレーム作成失敗");
+    }
+    Some(pf) => {
+      // PUT フレームは 4 + 1(Ver=1) + 1(Op=3) + 2 + 11 + 2 + 11 + 1(ttl_tag=1) + 8(ttl_sec) = 41 バイト
+      if pf.byte_len() != 41 {
+        return fail(&"stash_proto: PUT フレーム長");
+      }
+    }
+  }
+
+  // 応答解釈: Success (0x01)
+  let mut s_resp = Bytes.new();
+  s_resp.push(1);  // version = 1
+  s_resp.push(1);  // res_type = 1 (Success)
+  match parse_stash_response(&s_resp) {
+    Ok(v) => {
+      if v.is_none() {
+        return fail(&"stash_proto: Success 応答は Ok(Some)");
+      }
+    }
+    Err(_) => {
+      return fail(&"stash_proto: Success 応答解釈失敗");
+    }
+  }
+
+  // 応答解釈: Value (0x02)
+  let mut v_resp = Bytes.new();
+  v_resp.push(1);  // version = 1
+  v_resp.push(2);  // res_type = 2 (Value)
+  v_resp.push(0);
+  v_resp.push(5);
+  v_resp.extend(&"hello".as_bytes());
+  match parse_stash_response(&v_resp) {
+    Ok(opt) => {
+      match opt {
+        Some(b) => {
+          if b.to_string_utf8().unwrap_or("") != "hello" {
+            return fail(&"stash_proto: Value 応答値不一致");
+          }
+        }
+        None => {
+          return fail(&"stash_proto: Value 応答で値がない");
+        }
+      }
+    }
+    Err(_) => {
+      return fail(&"stash_proto: Value 応答解釈失敗");
+    }
+  }
+
+  // 応答解釈: NotFound (0x03)
+  let mut nf_resp = Bytes.new();
+  nf_resp.push(1);  // version = 1
+  nf_resp.push(3);  // res_type = 3 (NotFound)
+  match parse_stash_response(&nf_resp) {
+    Ok(v) => {
+      if v.is_some() {
+        return fail(&"stash_proto: NotFound 応答は値なし");
+      }
+    }
+    Err(_) => {
+      return fail(&"stash_proto: NotFound 応答解釈失敗");
+    }
+  }
+
+  // 応答解釈: Error (0x04)
+  let mut err_resp = Bytes.new();
+  err_resp.push(1);  // version = 1
+  err_resp.push(4);  // res_type = 4 (Error)
+  err_resp.push(4);  // code 4 = Capacity
+  err_resp.push(0);
+  err_resp.push(3);
+  err_resp.extend(&"cap".as_bytes());
+  match parse_stash_response(&err_resp) {
+    Ok(_) => {
+      return fail(&"stash_proto: Error 応答が Ok になった");
+    }
+    Err(code) => {
+      if code != 4 {
+        return fail(&"stash_proto: Error コード不一致");
+      }
+    }
+  }
+
+  return true;
+}
+
+fn config_ok(json: &String) -> Bool
+  intent "経路設定の JSON が解釈できたら true"
+  requires none
+  ensures none
+  effects none
+{
+  return parse_settings(&json.as_bytes()).is_ok();
+}
+
+pub fn run_cache_routes_config_tests() -> Bool
+  intent "経路設定における cache 設定の解釈テスト"
+  requires none
+  ensures none
+  effects console
+{
+  // 正常なプロキシ経路 + キャッシュ設定
+  let valid_json = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"backend\":\"127.0.0.1:6379\",\"ttl_sec\":120}}]}";
+  match parse_settings(&valid_json.as_bytes()) {
+    Err(_) => {
+      return fail(&"routes_cache: 正しい cache 設定が失敗");
+    }
+    Ok(s) => {
+      match s.routes.get(0) {
+        None => {
+          return fail(&"routes_cache: 経路なし");
+        }
+        Some(r) => {
+          match r.cache {
+            None => {
+              return fail(&"routes_cache: cache が None");
+            }
+            Some(c) => {
+              if c.backend_host != "127.0.0.1" || c.backend_port != 6379 || c.ttl_sec != 120 {
+                return fail(&"routes_cache: cache 設定値不一致");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ttl_sec 省略時はデフォルト 60
+  let default_ttl_json = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"backend\":\"127.0.0.1:6379\"}}]}";
+  match parse_settings(&default_ttl_json.as_bytes()) {
+    Err(_) => {
+      return fail(&"routes_cache: ttl_sec 省略の cache 設定が失敗");
+    }
+    Ok(s) => {
+      match s.routes.get(0) {
+        None => {
+          return fail(&"routes_cache: 経路なし");
+        }
+        Some(r) => {
+          match r.cache {
+            None => {
+              return fail(&"routes_cache: cache が None");
+            }
+            Some(c) => {
+              if c.ttl_sec != 60 {
+                return fail(&"routes_cache: ttl_sec デフォルト値不一致");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 静的配信経路に cache を指定すると拒否
+  let static_with_cache = "{\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/var/www\",\"cache\":{\"backend\":\"127.0.0.1:6379\"}}]}";
+  if config_ok(&static_with_cache) {
+    return fail(&"routes_cache: 静的配信経路への cache は拒否");
+  }
+
+  // backend なしの cache は拒否
+  let no_backend = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"ttl_sec\":60}}]}";
+  if config_ok(&no_backend) {
+    return fail(&"routes_cache: backend なしの cache は拒否");
+  }
+
+  // 不正な IPv4/ポートの backend は拒否
+  let bad_backend = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"backend\":\"invalid_host:6379\"}}]}";
+  if config_ok(&bad_backend) {
+    return fail(&"routes_cache: 不正ホストの cache backend は拒否");
+  }
+
+  // 不正な ttl_sec (< 1 または > 86400) は拒否
+  let zero_ttl = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"backend\":\"127.0.0.1:6379\",\"ttl_sec\":0}}]}";
+  if config_ok(&zero_ttl) {
+    return fail(&"routes_cache: ttl_sec=0 は拒否");
+  }
+
+  let big_ttl = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"backend\":\"127.0.0.1:6379\",\"ttl_sec\":100000}}]}";
+  if config_ok(&big_ttl) {
+    return fail(&"routes_cache: ttl_sec=100000 は拒否");
+  }
+
+  // 未知のキーは拒否
+  let unknown_key = "{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:8001\"],\"cache\":{\"backend\":\"127.0.0.1:6379\",\"foo\":1}}]}";
+  if config_ok(&unknown_key) {
+    return fail(&"routes_cache: 未知のキーは拒否");
+  }
+
+  return true;
+}
