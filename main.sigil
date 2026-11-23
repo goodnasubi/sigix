@@ -151,13 +151,22 @@ fn serve(cfg: &Config, settings: Settings) -> Int
           let slot = g.reserve();
           match listener.accept() {
             Ok(stream) => {
+              // 接続元の IP を `http.conn` に渡す前に取る（取れなければ None = 不明・信頼しない）。
+              let mut peer = None;
+              match stream.peer_addr() {
+                Ok(addr) => {
+                  let (ip, _) = addr;
+                  peer = Some(ip);
+                }
+                Err(_) => {}
+              }
               let conn = http.conn(stream);
               let shared_c = shared.clone();
               let cursors_c = cursors.clone();
               slot.start(conn, move |c| {
                 http.serve_conn(&c, &limits_for(max_body, handler_ms), |req| {
                   let st = shared_c.borrow();
-                  return handle(&st, &cursors_c, max_body, &req);
+                  return handle(&st, &cursors_c, max_body, &peer, &req);
                 });
               }, move |c| {
                 http.abort_conn(c, &limits_for(max_body, handler_ms));

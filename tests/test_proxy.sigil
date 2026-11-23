@@ -2,6 +2,8 @@ module tests.test_proxy
   targets server
   trust none
 
+use sigix.allowlist.is_trusted;
+use sigix.allowlist.normalize_peer;
 use sigix.conditional.etag;
 use sigix.conditional.http_date;
 use sigix.conditional.not_modified;
@@ -489,6 +491,56 @@ pub fn run_forward_tests() -> Bool
   let cloned = cursors.clone();
   if next_backend(&cloned, 0, 2) != 1 {
     return fail(&"forward: 複製した Lock でも巡回位置を共有する");
+  }
+  return true;
+}
+
+pub fn run_allowlist_tests() -> Bool
+  intent "信頼する接続元の判定をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  let mut l = List.new();
+  l.push("127.0.0.1");
+  l.push("::1");
+  l.push("10.0.0.0/8");
+  l.push("192.168.1.128/25");
+  if !is_trusted(&"127.0.0.1", &l) || !is_trusted(&"::1", &l) {
+    return fail(&"allowlist: ループバック");
+  }
+  if !is_trusted(&"10.1.2.3", &l) || !is_trusted(&"10.255.255.255", &l) {
+    return fail(&"allowlist: /8");
+  }
+  if is_trusted(&"11.0.0.1", &l) || is_trusted(&"9.255.255.255", &l) {
+    return fail(&"allowlist: /8 の外");
+  }
+  if !is_trusted(&"192.168.1.200", &l) || is_trusted(&"192.168.1.100", &l) {
+    return fail(&"allowlist: /25 の境界");
+  }
+  if is_trusted(&"203.0.113.9", &l) || is_trusted(&"2001:db8::1", &l) {
+    return fail(&"allowlist: 一致しない");
+  }
+  if !is_trusted(&"::1", &l) || is_trusted(&"::2", &l) {
+    return fail(&"allowlist: IPv6 は完全一致");
+  }
+  let empty = List.new();
+  if is_trusted(&"127.0.0.1", &empty) {
+    return fail(&"allowlist: 空のリストは何も信頼しない");
+  }
+  let mut all = List.new();
+  all.push("0.0.0.0/0");
+  if !is_trusted(&"8.8.8.8", &all) {
+    return fail(&"allowlist: /0");
+  }
+  if normalize_peer(&"::FFFF:10.1.2.3") != "10.1.2.3" {
+    return fail(&"allowlist: IPv4 射影アドレスの正規化");
+  }
+  if normalize_peer(&"2001:DB8::1") != "2001:db8::1" {
+    return fail(&"allowlist: IPv6 は小文字にそろえる");
+  }
+  if !is_trusted(&normalize_peer(&"::ffff:10.1.2.3"), &l) {
+    return fail(&"allowlist: 射影アドレスも IPv4 として照合");
   }
   return true;
 }

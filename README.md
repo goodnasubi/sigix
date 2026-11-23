@@ -63,7 +63,7 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 - `connect_timeout_ms`（既定 3000、1〜60000）・`read_timeout_ms`（既定 30000、1〜300000）。接続できない・時間切れ・応答が読めない・応答本文が `max_response_body` 超過のときは、固定本文 `Bad Gateway` の **502**。
 - 不明なキー・型の違い・範囲外・不正なアドレス・重複した `prefix`・開けない `root`・読めない設定ファイルは**起動時に拒否**（fail-closed。終了コードの代わりに戻り値 2 が標準出力の最終行に出る）。再読込は再起動のみ。
 - 要求・応答は解釈して組み直す（バイト列の素通しではない）。上流へは `Connection: close` の HTTP/1.1。ホップバイホップ（`Connection`・`Keep-Alive`・`Proxy-Authenticate`・`Proxy-Authorization`・`TE`・`Trailer`・`Transfer-Encoding`・`Upgrade`）と、`Connection` が名指しするヘッダは両方向で取り除く。
-- `X-Forwarded-For` / `Forwarded` / `X-Real-IP` / `X-Forwarded-Proto` は、信頼しない接続元のものを捨てる。`X-Forwarded-Proto` は信頼しない接続元には常に `http` で上書き（信頼する接続元は `https` のみ中継）。`trusted_proxies`（IPv4 / IPv4 CIDR / IPv6 単一アドレス。既定はループバック）は起動時に検査する。
+- `X-Forwarded-For` は、直接の接続元の IP を上流へ渡す（信頼する接続元には、届いた値の後ろに `, 接続元` と追記。信頼しない接続元の値は捨てて接続元の IP だけにする）。`Forwarded` / `X-Real-IP` は常に捨てる。`X-Forwarded-Proto` は信頼しない接続元には常に `http` で上書き（信頼する接続元は `https` のみ中継）。`trusted_proxies`（IPv4 / IPv4 CIDR / IPv6 単一アドレス。既定はループバック）は起動時に検査する。
 - 応答は全体を読んでから返す（ストリーミングなし。上流の応答は `Content-Length`・チャンク・接続の切断のどれかで終わりを決める。`Content-Length` と `Transfer-Encoding` の併記、食い違う `Content-Length`、1xx、未対応の転送符号は 502）。応答の解釈は sigix の中の最小実装（`sigix/respparse.sigil`。言語側に `HttpResponseParser` が入ったら置き換える）。
 - 条件付き GET: 静的ファイルに `ETag`（大きさと更新時刻から作る強い検証子）と `Last-Modified` を付け、`If-None-Match`（優先）・`If-Modified-Since`（IMF-fixdate のみ）が合えば本文を読まずに 304。`File.byte_len` / `File.mtime`（sigil ADR 0049 決定 8）を使う。
 - アクセスログはプロキシの経路だけ末尾に `転送先 上流の状態` が付く: `1763784000 GET /api/v1/users HTTP/1.1 200 1024 127.0.0.1:9000 200`。502 のときの上流の状態は `-`。
@@ -71,7 +71,7 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 ## 既知の制約・範囲外
 
 - TLS、HTTP/2、gzip、ストリーミング配信（プロキシも静的も全体を読んでから返す）、重み付け・ヘルスチェック・フェイルオーバー、設定の再読込（再起動のみ）。
-- **接続元の IP を取れない**（`TcpStream` にピアアドレスの API が無い。sigil Issue #721）。そのため現状は接続元をすべて「不明（信頼しない）」として扱い、`X-Forwarded-For` は**付けない**（クライアントが送ってきた値は捨てる）。`trusted_proxies` の判定ロジックは `headers.upstream_headers` に実装済みで、API が入れば接続元を渡すだけで有効になる。
+- 接続元の IP は `TcpStream.peer_addr`（sigil #721）で取り、`trusted_proxies` と照合する（IPv4 は完全一致と CIDR、IPv6 は小文字にそろえた完全一致。IPv4 射影アドレス `::ffff:a.b.c.d` は IPv4 として扱う）。取れなかったときは不明（信頼しない）として、`X-Forwarded-For` を付けない。
 - ETag は大きさと更新時刻（秒）から作る（ADR 0056 決定 5(c)）。同じ秒内に同じ長さで内容だけが変わった場合や、更新時刻を保つデプロイでは、古い検証子が一致して 304 になりうる（nginx / Apache の既定と同じ性質。内容ハッシュにすると 304 でも全体を読むことになるため採らない）。
 - プロキシの読み取り上限は、チャンク形式の応答では枠のオーバーヘッド分（本文の 7 倍まで）広げる。復号後の本文は `max_response_body` で厳密に制限する。
 - プロキシでの HEAD の応答は、上流の `Content-Length` を保てない（本文がないため 0 になる）。
@@ -84,5 +84,5 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 SIGIL=/path/to/sigil ./test.sh
 ```
 
-`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 15 件。後者は python3 で上流を 2 台立てる）を順に実行する。
+`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 16 件。後者は python3 で上流を 2 台立てる）を順に実行する。
 CI は sigil の main コミットを固定してコンパイラをビルドし、同じ `test.sh` を実行する（`.github/workflows/ci.yml`）。

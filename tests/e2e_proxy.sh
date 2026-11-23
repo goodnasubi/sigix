@@ -62,7 +62,7 @@ py() { python3 -c "$@"; }
 jfield() { printf '%s' "$1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$2"; }
 jfile() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }
 
-CONFIG_BASE='{"listen":"127.0.0.1:@SERVER@","connect_timeout_ms":1000,"read_timeout_ms":1500,"routes":[
+CONFIG_BASE='{"listen":"127.0.0.1:@SERVER@","trusted_proxies":["10.0.0.0/8"],"connect_timeout_ms":1000,"read_timeout_ms":1500,"routes":[
  {"prefix":"/api/","type":"proxy","backends":["127.0.0.1:'"$PA"'","127.0.0.1:'"$PB"'"]},
  {"prefix":"/static/","type":"static","root":"'"$WORK"'/static"},
  {"prefix":"/","type":"static","root":"'"$WORK"'/www"}]}'
@@ -82,13 +82,14 @@ ok "ラウンドロビン（$seq_out）"
 r="$(curl -s -H 'X-Forwarded-For: 6.6.6.6' -H 'Forwarded: for=6.6.6.6' -H 'X-Real-IP: 6.6.6.6' -H 'X-Forwarded-Proto: https' \
   -H 'Connection: keep-alive, X-Secret' -H 'X-Secret: s' -H 'Keep-Alive: timeout=9' -H 'TE: trailers' -H 'Upgrade: foo' -H 'X-Keep: yes' "$BASE/api/h")"
 [ "$(jfield "$r" 'd["headers"].get("x-forwarded-proto")')" = "http" ] || fail "X-Forwarded-Proto が http でない: $r"
+[ "$(jfield "$r" 'd["headers"].get("x-forwarded-for")')" = "127.0.0.1" ] || fail "X-Forwarded-For が直接の接続元だけでない（信頼しない接続元の値は捨てる）: $r"
 for h in forwarded x-real-ip x-secret keep-alive te upgrade transfer-encoding; do
   [ "$(jfield "$r" "'$h' in d['headers']")" = "False" ] || fail "$h が上流へ届いた: $r"
 done
 [ "$(jfield "$r" '"6.6.6.6" in json.dumps(d["headers"])')" = "False" ] || fail "偽装した接続元が上流へ届いた: $r"
 [ "$(jfield "$r" 'd["headers"].get("x-keep")')" = "yes" ] || fail "通常のヘッダが届かない: $r"
 [ "$(jfield "$r" 'd["headers"].get("connection")')" = "close" ] || fail "Connection: close を付ける: $r"
-ok "ヘッダの書き換え（偽装の破棄・ホップバイホップの剥離・X-Forwarded-Proto: http）"
+ok "ヘッダの書き換え（信頼しない接続元: 偽装の破棄・X-Forwarded-For は接続元の IP・ホップバイホップの剥離・X-Forwarded-Proto: http）"
 
 # 経路・クエリはそのまま
 [ "$(jfield "$r" 'd["path"]')" = "/api/h" ] || fail "経路: $r"
@@ -190,6 +191,19 @@ t1=$(date +%s.%N)
 [ "$code" = "502" ] || fail "接続の枠が大きくても応答しない上流は 502（実際 $code）"
 py 'import sys; d=float(sys.argv[2])-float(sys.argv[1]); sys.exit(0 if 0.8 < d < 4.0 else 1)' "$t0" "$t1" || fail "read_timeout_ms が接続の枠に引き伸ばされている"
 ok "read_timeout_ms は接続の所要時間と独立（connect 20000・read 1000 でも約 1 秒で 502）"
+
+# 信頼する接続元（既定のループバック）: X-Forwarded-For は追記、X-Forwarded-Proto は中継、Forwarded / X-Real-IP は捨てる
+TRUST_CONFIG='{"listen":"127.0.0.1:@SERVER@","routes":[
+ {"prefix":"/api/","type":"proxy","backends":["127.0.0.1:'"$PA"'"]},
+ {"prefix":"/","type":"static","root":"'"$WORK"'/www"}]}'
+start_sigix "$TRUST_CONFIG"
+r="$(curl -s -H 'X-Forwarded-For: 203.0.113.7' -H 'X-Forwarded-Proto: https' -H 'Forwarded: for=6.6.6.6' -H 'X-Real-IP: 6.6.6.6' "$BASE/api/trusted")"
+[ "$(jfield "$r" 'd["headers"].get("x-forwarded-for")')" = "203.0.113.7, 127.0.0.1" ] || fail "信頼する接続元の X-Forwarded-For は追記: $r"
+[ "$(jfield "$r" 'd["headers"].get("x-forwarded-proto")')" = "https" ] || fail "信頼する接続元の X-Forwarded-Proto は中継: $r"
+[ "$(jfield "$r" "'forwarded' in d['headers'] or 'x-real-ip' in d['headers']")" = "False" ] || fail "Forwarded / X-Real-IP は捨てる: $r"
+r="$(curl -s "$BASE/api/trusted2")"
+[ "$(jfield "$r" 'd["headers"].get("x-forwarded-for")')" = "127.0.0.1" ] || fail "前の値が無ければ接続元の IP だけ: $r"
+ok "信頼する接続元（既定のループバック）: X-Forwarded-For 追記・X-Forwarded-Proto 中継"
 
 # 3'. Host を転送先へ書き換える設定
 HOST_CONFIG='{"listen":"127.0.0.1:@SERVER@","routes":[

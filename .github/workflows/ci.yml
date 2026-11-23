@@ -19,7 +19,7 @@ env:
   CARGO_TERM_COLOR: always
   # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
   # sigix 段階 1 のコードは、この版（またはそれ以前の同等の版）のローカルビルドで test.sh 全量の通過を確認済み。
-  SIGIL_REF: 43285e5ff848f1cac4c5b6c17afcd884cf9a7887
+  SIGIL_REF: 0c1c441e60933fadbe05e1c5c63b11bcf4ad4409
 
 jobs:
   # 変更検出（sigil 本体 Issue #562 項目1、sigil-db と同じ役割）。

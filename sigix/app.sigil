@@ -2,6 +2,8 @@ module sigix.app
   targets server
   trust none
 
+use sigix.allowlist.is_trusted;
+use sigix.allowlist.normalize_peer;
 use sigix.headers.source;
 use sigix.proxy.forward;
 use sigix.routes.Settings;
@@ -56,7 +58,7 @@ fn rest_of(path: &Bytes, prefix_len: Int) -> Bytes
   return sub(&path, prefix_len, path.byte_len());
 }
 
-pub fn handle(settings: &Settings, cursors: &Lock<List<Int>>, max_body: Int, req: &HttpRequest) -> HttpResponse
+pub fn handle(settings: &Settings, cursors: &Lock<List<Int>>, max_body: Int, peer: &Option<String>, req: &HttpRequest) -> HttpResponse
   intent "要求を経路接頭辞で静的配信かプロキシに振り分けて応答を返し、アクセスログを 1 行出す"
   requires 1 <= max_body
   ensures none
@@ -78,8 +80,16 @@ pub fn handle(settings: &Settings, cursors: &Lock<List<Int>>, max_body: Int, req
         }
         Some(route) => {
           if route.proxy {
-            // 接続元の IP は言語側にまだ無い（sigil Issue #721）ので、接続元は不明（信頼しない）として扱う。
-            let src = source(false, &None);
+            // 接続元の IP（`TcpStream.peer_addr`、sigil #721）を許可リストと照合する。取れなかったときは不明（信頼しない）。
+            let mut src = source(false, &None);
+            match peer {
+              None => {}
+              Some(text) => {
+                let ip = normalize_peer(&text);
+                let trusted = is_trusted(&ip, &settings.trusted);
+                src = source(trusted, &Some(ip));
+              }
+            }
             let done = forward(&req, &src, &route, idx, &cursors, settings.connect_ms, settings.read_ms, max_body);
             console.log(&log_line(&req, &done.res, &done.backend, done.upstream));
             return done.res;
