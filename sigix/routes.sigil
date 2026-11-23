@@ -17,7 +17,7 @@ use sigix.text.starts_with_at;
 //     "connect_timeout_ms": 3000,
 //     "read_timeout_ms": 30000,
 //     "routes": [
-//       { "prefix": "/api/", "type": "proxy", "backends": ["127.0.0.1:9000", "127.0.0.1:9001"], "host": "preserve" },
+//       { "prefix": "/api/", "type": "proxy", "backends": ["127.0.0.1:9000", "127.0.0.1:9001"], "host": "preserve", "cache": { "backend": "127.0.0.1:7379", "ttl_sec": 60 } },
 //       { "prefix": "/", "type": "static", "root": "/srv/www" }
 //     ]
 //   }
@@ -27,12 +27,28 @@ pub struct Backend {
   port: Int,
 }
 
+pub struct CacheConfig {
+  backend_host: String,
+  backend_port: Int,
+  ttl_sec: Int,
+}
+
+pub fn cache_config(host: &String, port: Int, ttl: Int) -> CacheConfig
+  intent "キャッシュ設定を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return CacheConfig { backend_host: host.clone(), backend_port: port, ttl_sec: ttl };
+}
+
 pub struct Route {
   prefix: String,
   proxy: Bool,
   root: String,
   backends: List<Backend>,
   host_mode: HostMode,
+  cache: Option<CacheConfig>,
 }
 
 pub struct Settings {
@@ -50,7 +66,7 @@ pub fn static_route(prefix: &String, root: &String) -> Route
   ensures none
   effects none
 {
-  return Route { prefix: prefix.clone(), proxy: false, root: root.clone(), backends: List.new(), host_mode: HostMode.Preserve };
+  return Route { prefix: prefix.clone(), proxy: false, root: root.clone(), backends: List.new(), host_mode: HostMode.Preserve, cache: None };
 }
 
 pub fn default_trusted() -> List<String>
@@ -474,6 +490,77 @@ fn parse_backends(nodes: &List<JsonNode>, idx: Int) -> Result<List<Backend>, Str
   return Ok(out);
 }
 
+fn parse_cache_config(nodes: &List<JsonNode>, idx: Int) -> Result<CacheConfig, String>
+  intent "経路の cache 設定を読む（backend は必須、ttl_sec は任意で既定 60）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut fields = List.new();
+  match fields_at(&nodes, idx) {
+    Some(f) => {
+      fields = f;
+    }
+    None => {
+      return Err("sigix: cache はオブジェクトで指定してください");
+    }
+  }
+  let mut allowed = List.new();
+  allowed.push("backend");
+  allowed.push("ttl_sec");
+  if !keys_ok(&fields, &allowed) {
+    return Err("sigix: cache に不明または重複したキーがあります（backend / ttl_sec）");
+  }
+  let mut backend_text = "";
+  match field(&fields, &"backend") {
+    None => {
+      return Err("sigix: cache には backend が必要です");
+    }
+    Some(i) => {
+      match str_at(&nodes, i) {
+        None => {
+          return Err("sigix: cache.backend は文字列で指定してください");
+        }
+        Some(s) => {
+          backend_text = s;
+        }
+      }
+    }
+  }
+  let mut b_host = "";
+  let mut b_port = 0;
+  match parse_listen(&backend_text) {
+    None => {
+      return Err("sigix: cache.backend の形が不正です（例: 127.0.0.1:7379、[::1]:7379）");
+    }
+    Some(c) => {
+      if !ip_ok(&c.host) {
+        return Err("sigix: cache.backend は数値の IP アドレスで指定してください（名前解決はしません）");
+      }
+      b_host = c.host;
+      b_port = c.port;
+    }
+  }
+  let mut ttl_sec = 60;
+  match field(&fields, &"ttl_sec") {
+    None => {}
+    Some(i) => {
+      match int_at(&nodes, i) {
+        None => {
+          return Err("sigix: cache.ttl_sec は整数で指定してください");
+        }
+        Some(v) => {
+          if v < 1 || v > 86400 {
+            return Err("sigix: cache.ttl_sec は 1〜86400 の範囲で指定してください");
+          }
+          ttl_sec = v;
+        }
+      }
+    }
+  }
+  return Ok(CacheConfig { backend_host: b_host, backend_port: b_port, ttl_sec: ttl_sec });
+}
+
 fn parse_route(nodes: &List<JsonNode>, idx: Int) -> Result<Route, String>
   intent "経路 1 件を読む"
   requires none
@@ -489,8 +576,10 @@ fn parse_route(nodes: &List<JsonNode>, idx: Int) -> Result<Route, String>
       return Err("sigix: routes の要素はオブジェクトです");
     }
   }
-  if !keys_ok(&fields, &names(&"prefix", &"type", &"root", &"backends", &"host")) {
-    return Err("sigix: routes に不明または重複したキーがあります（prefix / type / root / backends / host）");
+  let mut allowed = names(&"prefix", &"type", &"root", &"backends", &"host");
+  allowed.push("cache");
+  if !keys_ok(&fields, &allowed) {
+    return Err("sigix: routes に不明または重複したキーがあります（prefix / type / root / backends / host / cache）");
   }
   let prefix = match field(&fields, &"prefix") {
     Some(i) => str_at(&nodes, i),
@@ -506,8 +595,8 @@ fn parse_route(nodes: &List<JsonNode>, idx: Int) -> Result<Route, String>
   }
   let k = kind.unwrap_or("");
   if k == "static" {
-    if field(&fields, &"backends").is_some() || field(&fields, &"host").is_some() {
-      return Err("sigix: static の経路に backends / host は指定できません");
+    if field(&fields, &"backends").is_some() || field(&fields, &"host").is_some() || field(&fields, &"cache").is_some() {
+      return Err("sigix: static の経路に backends / host / cache は指定できません");
     }
     let root = match field(&fields, &"root") {
       Some(i) => str_at(&nodes, i),
@@ -547,7 +636,15 @@ fn parse_route(nodes: &List<JsonNode>, idx: Int) -> Result<Route, String>
         }
       }
     }
-    return Ok(Route { prefix: pfx, proxy: true, root: "", backends: backends, host_mode: mode });
+    let mut cache_cfg = None;
+    match field(&fields, &"cache") {
+      None => {}
+      Some(ci) => {
+        let c = parse_cache_config(&nodes, ci)?;
+        cache_cfg = Some(c);
+      }
+    }
+    return Ok(Route { prefix: pfx, proxy: true, root: "", backends: backends, host_mode: mode, cache: cache_cfg });
   }
   return Err("sigix: type は \"static\" か \"proxy\" です");
 }
@@ -570,10 +667,10 @@ fn insert_sorted(routes: &List<Route>, r: Route) -> Result<List<Route>, String>
           return Err("sigix: 同じ prefix の経路が重複しています");
         }
         if !placed && r.prefix.byte_len() > e.prefix.byte_len() {
-          out.push(Route { prefix: r.prefix.clone(), proxy: r.proxy, root: r.root.clone(), backends: r.backends.clone(), host_mode: r.host_mode.clone() });
+          out.push(Route { prefix: r.prefix.clone(), proxy: r.proxy, root: r.root.clone(), backends: r.backends.clone(), host_mode: r.host_mode.clone(), cache: r.cache.clone() });
           placed = true;
         }
-        out.push(Route { prefix: e.prefix.clone(), proxy: e.proxy, root: e.root.clone(), backends: e.backends.clone(), host_mode: e.host_mode.clone() });
+        out.push(Route { prefix: e.prefix.clone(), proxy: e.proxy, root: e.root.clone(), backends: e.backends.clone(), host_mode: e.host_mode.clone(), cache: e.cache.clone() });
       }
     }
     i = i + 1;

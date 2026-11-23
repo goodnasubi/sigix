@@ -1,0 +1,1014 @@
+module sigix.cache
+  targets server
+  trust none
+
+use sigix.headers.Hdr;
+use sigix.headers.hdr;
+use sigix.headers.header_value;
+use sigix.routes.Route;
+use sigix.routes.cache_config;
+use sigix.text.decimal;
+use sigix.text.eq_ignore_case;
+use sigix.text.find_from;
+use sigix.text.lower_bytes;
+use sigix.text.lower_string;
+use sigix.text.parse_dec;
+use sigix.text.split_commas;
+use sigix.text.sub;
+use sigix.text.trim_ows;
+
+// ADR 0059 段 4: sigix の任意のキャッシュ連携（sigil-stash-kv 利用）。
+// 経路ごとにキャッシュを明示的に有効化し、共有を許可した公開 GET の応答だけを有限 TTL で保存する。
+//
+// 共有の条件:
+// 1. 対象の識別子: 経路接頭辞（prefix）、小文字のホスト（Host）、パス（Path）、クエリ（Query）が一致すること。
+// 2. 要求の条件:
+//    - メソッドが GET であること。
+//    - Authorization ヘッダを含まないこと（認証付き要求の通過）。
+//    - Cookie ヘッダを含まないこと（Cookie に依存する要求の通過）。
+//    - Cache-Control に no-store / no-cache を含まないこと。
+// 3. 応答の条件:
+//    - ステータスが 200 OK であること。
+//    - Set-Cookie ヘッダを含まないこと（共有禁止）。
+//    - Vary ヘッダを含まないこと（表現を区別できない応答の通過）。
+//    - Cache-Control に private / no-store / no-cache を含まないこと。
+//    - 共有が許可されていること（public、または s-maxage / max-age の指定があること）。
+//    - 有効な正の有限 TTL（秒）が定まること。
+// 4. 上限の条件:
+//    - 生成されたキーが 1〜512 バイト以内であること。
+//    - 符号化された応答表現が 0〜3072 バイト（stash-kv の値上限）以内であること。
+//
+// 通過（オリジン利用）の条件:
+// - 要求または応答が上記の条件を満たさない場合（認証・Cookie・Set-Cookie・Vary・private・no-store・上限超過）。
+// - キャッシュミス、期限切れ。
+// - 容量超過（stash-kv の Capacity エラー）や KV 障害（接続不可・タイムアウト・切断・エラー）。
+
+fn read_u16_be(data: &Bytes, offset: Int) -> Int
+  intent "16 ビット符号なしビッグエンディアン整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let b0 = data.get(offset).unwrap_or(0);
+  let b1 = data.get(offset + 1).unwrap_or(0);
+  return b0 * 256 + b1;
+}
+
+fn read_u32_be(data: &Bytes, offset: Int) -> Int
+  intent "32 ビット符号なしビッグエンディアン整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let b0 = data.get(offset).unwrap_or(0);
+  let b1 = data.get(offset + 1).unwrap_or(0);
+  let b2 = data.get(offset + 2).unwrap_or(0);
+  let b3 = data.get(offset + 3).unwrap_or(0);
+  return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
+}
+
+fn read_u64_be(data: &Bytes, offset: Int) -> Int
+  intent "64 ビット符号なしビッグエンディアン整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let hi = read_u32_be(&data, offset);
+  let lo = read_u32_be(&data, offset + 4);
+  return hi * 4294967296 + lo;
+}
+
+fn strip_quotes(b: &Bytes) -> Bytes
+  intent "前後の引用符（\"）を除去する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = b.byte_len();
+  if len >= 2 && b.get(0).unwrap_or(0) == 34 && b.get(len - 1).unwrap_or(0) == 34 {
+    return sub(&b, 1, len - 1);
+  }
+  return b.clone();
+}
+
+pub fn extract_age(headers: &List<Hdr>) -> Int
+  intent "応答ヘッダから Age の秒数を解釈する（無ければ 0）"
+  requires none
+  ensures none
+  effects none
+{
+  match header_value(&headers, &"age") {
+    None => {
+      return 0;
+    }
+    Some(val) => {
+      let trimmed = trim_ows(&val);
+      match parse_dec(&trimmed) {
+        None => {
+          return 0;
+        }
+        Some(a) => {
+          if a < 0 {
+            return 0;
+          }
+          return a;
+        }
+      }
+    }
+  }
+}
+
+// 要求から Host ヘッダの値を取り出す（無ければ空文字列）。小文字にそろえる。
+fn request_host(req: &HttpRequest) -> String
+  intent "要求から Host ヘッダを取り出して小文字の文字列にする"
+  requires none
+  ensures none
+  effects none
+{
+  let all = req.headers();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        if eq_ignore_case(&h.name().as_bytes(), &"host".as_bytes()) {
+          return lower_bytes(&h.value()).to_string_utf8().unwrap_or("");
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+pub struct ReqCachePolicy {
+  no_store: Bool,
+  no_cache: Bool,
+  max_age: Option<Int>,
+  min_fresh: Option<Int>,
+}
+
+pub fn parse_request_cache_control(req: &HttpRequest) -> ReqCachePolicy
+  intent "要求ヘッダから Cache-Control ディレクティブ（no-store, no-cache, max-age, min-fresh）および Cache-Control なしの Pragma: no-cache を解釈する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut has_cache_control = false;
+  let mut pragma_no_cache = false;
+  let mut no_store = false;
+  let mut no_cache = false;
+  let mut max_age = None;
+  let mut min_fresh = None;
+  let all = req.headers();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        let name = lower_string(&h.name());
+        if name == "cache-control" {
+          has_cache_control = true;
+          let directives = split_commas(&h.value());
+          let mut j = 0;
+          while j < directives.len() {
+            match directives.get(j) {
+              None => {}
+              Some(d) => {
+                let trimmed = trim_ows(&d);
+                let eq_idx = find_from(&trimmed, &"=".as_bytes(), 0);
+                let mut name_part = trimmed.clone();
+                let mut arg_part = Bytes.new();
+                if eq_idx >= 0 {
+                  name_part = trim_ows(&sub(&trimmed, 0, eq_idx));
+                  arg_part = strip_quotes(&trim_ows(&sub(&trimmed, eq_idx + 1, trimmed.byte_len())));
+                }
+                let ld = lower_bytes(&name_part);
+                if eq_ignore_case(&ld, &"no-store".as_bytes()) {
+                  no_store = true;
+                } else if eq_ignore_case(&ld, &"no-cache".as_bytes()) {
+                  no_cache = true;
+                } else if eq_ignore_case(&ld, &"max-age".as_bytes()) {
+                  match parse_dec(&arg_part) {
+                    Some(sec) => {
+                      if sec >= 0 {
+                        match max_age {
+                          None => {
+                            max_age = Some(sec);
+                          }
+                          Some(cur) => {
+                            if sec < cur {
+                              max_age = Some(sec);
+                            }
+                          }
+                        }
+                      }
+                    }
+                    None => {}
+                  }
+                } else if eq_ignore_case(&ld, &"min-fresh".as_bytes()) {
+                  match parse_dec(&arg_part) {
+                    Some(sec) => {
+                      if sec >= 0 {
+                        match min_fresh {
+                          None => {
+                            min_fresh = Some(sec);
+                          }
+                          Some(cur) => {
+                            if sec > cur {
+                              min_fresh = Some(sec);
+                            }
+                          }
+                        }
+                      }
+                    }
+                    None => {}
+                  }
+                }
+              }
+            }
+            j = j + 1;
+          }
+        } else if name == "pragma" {
+          let directives = split_commas(&h.value());
+          let mut j = 0;
+          while j < directives.len() {
+            match directives.get(j) {
+              None => {}
+              Some(d) => {
+                let trimmed = trim_ows(&d);
+                let eq_idx = find_from(&trimmed, &"=".as_bytes(), 0);
+                let mut name_part = trimmed.clone();
+                if eq_idx >= 0 {
+                  name_part = trim_ows(&sub(&trimmed, 0, eq_idx));
+                }
+                let ld = lower_bytes(&name_part);
+                if eq_ignore_case(&ld, &"no-cache".as_bytes()) {
+                  pragma_no_cache = true;
+                }
+              }
+            }
+            j = j + 1;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if !has_cache_control && pragma_no_cache {
+    no_cache = true;
+  }
+  return ReqCachePolicy { no_store: no_store, no_cache: no_cache, max_age: max_age, min_fresh: min_fresh };
+}
+
+// 要求がキャッシュ可能か判定する。
+// GET のみ、Authorization なし、Cookie なし、Cache-Control に no-store/no-cache（引数付き含む）なし。
+pub fn request_cacheable(req: &HttpRequest) -> Bool
+  intent "要求がキャッシュ利用・保存の対象か判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if req.method() != "GET" {
+    return false;
+  }
+  let all = req.headers();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        let name = lower_string(&h.name());
+        if name == "authorization" || name == "cookie" {
+          return false;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let policy = parse_request_cache_control(&req);
+  if policy.no_store || policy.no_cache {
+    return false;
+  }
+  return true;
+}
+
+// 応答ヘッダのリストから Cache-Control に基づく鮮度期間（秒）を決定する。
+// 共有禁止（private / no-store / no-cache）または指示なしは -1。
+pub fn response_freshness_lifetime(headers: &List<Hdr>, default_ttl: Int) -> Int
+  intent "応答ヘッダの Cache-Control から鮮度期間（秒）を決定する。共有不可時は -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut is_public = false;
+  let mut s_maxage = -1;
+  let mut max_age = -1;
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      None => {}
+      Some(h) => {
+        if h.name == "cache-control" {
+          let parts = split_commas(&h.value);
+          let mut j = 0;
+          while j < parts.len() {
+            match parts.get(j) {
+              None => {}
+              Some(p) => {
+                let trimmed = trim_ows(&p);
+                let eq_idx = find_from(&trimmed, &"=".as_bytes(), 0);
+                let mut name_part = trimmed.clone();
+                let mut arg_part = Bytes.new();
+                if eq_idx >= 0 {
+                  name_part = trim_ows(&sub(&trimmed, 0, eq_idx));
+                  arg_part = strip_quotes(&trim_ows(&sub(&trimmed, eq_idx + 1, trimmed.byte_len())));
+                }
+                let lp = lower_bytes(&name_part);
+                if eq_ignore_case(&lp, &"private".as_bytes()) || eq_ignore_case(&lp, &"no-store".as_bytes()) || eq_ignore_case(&lp, &"no-cache".as_bytes()) {
+                  return -1;
+                }
+                if eq_ignore_case(&lp, &"public".as_bytes()) {
+                  is_public = true;
+                } else if eq_ignore_case(&lp, &"s-maxage".as_bytes()) {
+                  match parse_dec(&arg_part) {
+                    Some(sec) => {
+                      s_maxage = sec;
+                    }
+                    None => {}
+                  }
+                } else if eq_ignore_case(&lp, &"max-age".as_bytes()) {
+                  match parse_dec(&arg_part) {
+                    Some(sec) => {
+                      max_age = sec;
+                    }
+                    None => {}
+                  }
+                }
+              }
+            }
+            j = j + 1;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if s_maxage >= 0 {
+    return s_maxage;
+  }
+  if max_age >= 0 {
+    return max_age;
+  }
+  if is_public {
+    return default_ttl;
+  }
+  return -1;
+}
+
+// 応答ヘッダのリストから、Cache-Control の指示と現行 Age を考慮して残り TTL を計算する。
+// 共有禁止（private / no-store / no-cache / Set-Cookie / Vary）なら None。
+// フィールド指定付きの private / no-cache（例: private="x-user-info"）も保守的に拒否（P1）。
+// 応答の現行 Age を考慮して残り鮮度期間（秒）を計算し、既に stale または使い切っていれば None（P2）。
+// 共有可能なら Some(remaining_ttl)（s-maxage > max-age > default_ttl から現行 Age を減算）。
+pub fn response_cacheable(status: Int, headers: &List<Hdr>, default_ttl: Int) -> Option<Int>
+  intent "応答が共有キャッシュに保存可能か判定し、残りの有効期間（秒）を返す。失効済み・共有不可は None"
+  requires none
+  ensures none
+  effects none
+{
+  if status != 200 {
+    return None;
+  }
+  if header_value(&headers, &"set-cookie").is_some() {
+    return None;
+  }
+  if header_value(&headers, &"vary").is_some() {
+    return None;
+  }
+  let freshness = response_freshness_lifetime(&headers, default_ttl);
+  if freshness <= 0 {
+    return None;
+  }
+  let current_age = extract_age(&headers);
+  let remaining_ttl = freshness - current_age;
+  if remaining_ttl <= 0 {
+    return None;
+  }
+  return Some(remaining_ttl);
+}
+
+// キャッシュキーを組み立てる。
+// 形式: `prefix:host:path` または `prefix:host:path?query`
+// キー長が 1〜512 バイトの範囲外なら None（上限超過）。
+pub fn make_cache_key(prefix: &String, host: &String, path: &Bytes, query: &Bytes) -> Option<Bytes>
+  intent "経路と対象の識別子からキャッシュキーを組み立てる。上限 512 バイト超過は None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut key = Bytes.new();
+  key.extend(&prefix.as_bytes());
+  key.push(58);  // ':'
+  key.extend(&host.as_bytes());
+  key.push(58);  // ':'
+  key.extend(&path);
+  if query.byte_len() > 0 {
+    key.push(63);  // '?'
+    key.extend(&query);
+  }
+  if key.byte_len() < 1 || key.byte_len() > 512 {
+    return None;
+  }
+  return Some(key);
+}
+
+// HttpResponse の内容を stash-kv に保存するバイナリ値に直列化する。
+// 形式: cached_at (u64 BE) + initial_age (u32 BE) + status (u16 BE) + count (u16 BE) + [name_len (u16 BE) + name + val_len (u16 BE) + val]* + body
+// 値長が 3072 バイトを超える場合は None（上限超過）。
+pub fn serialize_cached_response(status: Int, headers: &List<Hdr>, body: &Bytes, cached_at: Int, initial_age: Int) -> Option<Bytes>
+  intent "応答を直列化する。3072 バイト超過は None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push_u64_be(cached_at);
+  out.push_u32_be(initial_age);
+  out.push_u16_be(status);
+  out.push_u16_be(headers.len());
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      None => {}
+      Some(h) => {
+        let nb = h.name.as_bytes();
+        out.push_u16_be(nb.byte_len());
+        out.extend(&nb);
+        out.push_u16_be(h.value.byte_len());
+        out.extend(&h.value);
+      }
+    }
+    i = i + 1;
+  }
+  out.extend(&body);
+  if out.byte_len() > 3072 {
+    return None;
+  }
+  return Some(out);
+}
+
+// 直列化されたバイナリ値から HttpResponse を復元し、現行の Age ヘッダを付与する。
+pub fn deserialize_cached_response(data: &Bytes, now: Int) -> Option<HttpResponse>
+  intent "直列化データから HttpResponse を復元し、経過時間を反映した Age を付与する。形式不正は None"
+  requires none
+  ensures none
+  effects none
+{
+  let len = data.byte_len();
+  if len < 16 {
+    return None;
+  }
+  let cached_at = read_u64_be(&data, 0);
+  let initial_age = read_u32_be(&data, 8);
+  let status = read_u16_be(&data, 12);
+  let count = read_u16_be(&data, 14);
+  let mut offset = 16;
+  let mut hdrs = List.new();
+  let mut i = 0;
+  while i < count {
+    if offset + 2 > len {
+      return None;
+    }
+    let nlen = read_u16_be(&data, offset);
+    offset = offset + 2;
+    if offset + nlen > len {
+      return None;
+    }
+    let name_b = data.slice(offset, offset + nlen).unwrap_or(Bytes.new());
+    offset = offset + nlen;
+    if offset + 2 > len {
+      return None;
+    }
+    let vlen = read_u16_be(&data, offset);
+    offset = offset + 2;
+    if offset + vlen > len {
+      return None;
+    }
+    let val_b = data.slice(offset, offset + vlen).unwrap_or(Bytes.new());
+    offset = offset + vlen;
+    let name_str = name_b.to_string_utf8().unwrap_or("");
+    if !eq_ignore_case(&name_b, &"age".as_bytes()) {
+      hdrs.push(hdr(&name_str, &val_b));
+    }
+    i = i + 1;
+  }
+  let mut delta = now - cached_at;
+  if delta < 0 {
+    delta = 0;
+  }
+  let current_age = initial_age + delta;
+  let body = data.slice(offset, len).unwrap_or(Bytes.new());
+  let mut res = HttpResponse.new(status, body);
+  let mut k = 0;
+  while k < hdrs.len() {
+    match hdrs.get(k) {
+      None => {}
+      Some(h) => {
+        res = res.with_header(&h.name, &h.value);
+      }
+    }
+    k = k + 1;
+  }
+  res = res.with_header(&"age", &decimal(current_age));
+  return Some(res);
+}
+
+// stash-kv の GET 要求電文を組み立てる。
+// フレーム長 (u32 BE) + Version (1) + Op (2) + key_len (u16 BE) + key
+pub fn encode_stash_get(key: &Bytes) -> Bytes
+  intent "stash-kv の GET 要求フレームを符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(1);  // Version: 1
+  payload.push(2);  // Op: 2 (GET)
+  payload.push_u16_be(key.byte_len());
+  payload.extend(&key);
+  let mut frame = Bytes.new();
+  frame.push_u32_be(payload.byte_len());
+  frame.extend(&payload);
+  return frame;
+}
+
+// stash-kv の PUT 要求電文を組み立てる。
+// フレーム長 (u32 BE) + Version (1) + Op (3) + key_len (u16 BE) + key + val_len (u16 BE) + val + ttl_tag (1) + ttl_sec (u64 BE)
+pub fn encode_stash_put(key: &Bytes, val: &Bytes, ttl_sec: Int) -> Option<Bytes>
+  intent "stash-kv の PUT 要求フレームを符号化する。フレーム長 4096 超過時は None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(1);  // Version: 1
+  payload.push(3);  // Op: 3 (PUT)
+  payload.push_u16_be(key.byte_len());
+  payload.extend(&key);
+  payload.push_u16_be(val.byte_len());
+  payload.extend(&val);
+  payload.push(1);  // ttl_tag: 1 (Seconds)
+  payload.push_u64_be(ttl_sec);
+  if payload.byte_len() > 4094 {
+    return None;
+  }
+  let mut frame = Bytes.new();
+  frame.push_u32_be(payload.byte_len());
+  frame.extend(&payload);
+  return Some(frame);
+}
+
+// stash-kv の DELETE 要求電文を組み立てる。
+// フレーム長 (u32 BE) + Version (1) + Op (4) + key_len (u16 BE) + key
+pub fn encode_stash_delete(key: &Bytes) -> Bytes
+  intent "stash-kv の DELETE 要求フレームを符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(1);  // Version: 1
+  payload.push(4);  // Op: 4 (DELETE)
+  payload.push_u16_be(key.byte_len());
+  payload.extend(&key);
+  let mut frame = Bytes.new();
+  frame.push_u32_be(payload.byte_len());
+  frame.extend(&payload);
+  return frame;
+}
+
+// stash-kv の応答ペイロード（Length より後ろのバイト列）を解釈する。
+// Ok(Some(val)): Value 応答
+// Ok(None): NotFound 応答（ミスまたは期限切れ）
+// Err(code): Error 応答（1=UnknownOp, 7=Capacity など）または形式不正
+pub fn parse_stash_response(payload: &Bytes) -> Result<Option<Bytes>, Int>
+  intent "stash-kv 応答ペイロードを解釈する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = payload.byte_len();
+  if len < 2 {
+    return Err(-1);
+  }
+  let version = payload.get(0).unwrap_or(0);
+  if version != 1 {
+    return Err(-1);
+  }
+  let res_type = payload.get(1).unwrap_or(0);
+  if res_type == 1 {
+    // Success
+    return Ok(Some(Bytes.new()));
+  }
+  if res_type == 2 {
+    // Value
+    if len < 4 {
+      return Err(-1);
+    }
+    let val_len = read_u16_be(&payload, 2);
+    if len < 4 + val_len {
+      return Err(-1);
+    }
+    return Ok(Some(payload.slice(4, 4 + val_len).unwrap_or(Bytes.new())));
+  }
+  if res_type == 3 {
+    // NotFound
+    return Ok(None);
+  }
+  if res_type == 4 {
+    // Error
+    let code = payload.get(2).unwrap_or(0);
+    return Err(code);
+  }
+  return Err(-1);
+}
+
+// クライアント側ソケットから正確に count バイト読む。
+fn read_exact(c: &mut TcpClient, count: Int) -> Option<Bytes>
+  intent "ソケットから指定バイト数を読み切る。切断・エラーは None"
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut out = Bytes.new();
+  while out.byte_len() < count {
+    let mut to_read = count - out.byte_len();
+    if to_read > 4096 {
+      to_read = 4096;
+    }
+    match c.read(to_read) {
+      Err(_) => {
+        return None;
+      }
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return None;
+        }
+        out.extend(&chunk);
+      }
+    }
+  }
+  return Some(out);
+}
+
+// stash-kv へ要求を送り、応答ペイロードを読む。
+fn stash_talk(c: &mut TcpClient, req_frame: &Bytes) -> Option<Bytes>
+  intent "stash-kv へ要求を書き込み、応答ペイロードを読む"
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match c.write_all(&req_frame) {
+    Err(_) => {
+      return None;
+    }
+    Ok(_) => {}
+  }
+  let hdr_bytes = read_exact(&mut c, 4)?;
+  let len = hdr_bytes.read_u32_be(0).unwrap_or(0);
+  if len < 2 || len > 4096 {
+    return None;
+  }
+  return read_exact(&mut c, len);
+}
+
+// stash-kv からキーの値を取得する。
+// 障害・ミス・期限切れ・エラー時はすべて None を返す（安全にオリジンへ倒す）。
+pub fn cache_get(host: &String, port: Int, key: &Bytes) -> Option<HttpResponse>
+  intent "stash-kv からキャッシュされた応答を取得する。障害・ミスは None"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let target = host.clone();
+  let k = key.clone();
+  let frame = encode_stash_get(&k);
+  let talk_res = task.timeout(1000, move || {
+    match net.connect(&target, port) {
+      Err(_) => {
+        return None;
+      }
+      Ok(c0) => {
+        let mut conn = c0;
+        return stash_talk(&mut conn, &frame);
+      }
+    }
+  });
+  let opt_payload = talk_res.unwrap_or(None);
+  let now = clock.unix_seconds().unwrap_or(0);
+  return match opt_payload {
+    None => None,
+    Some(payload) => match parse_stash_response(&payload) {
+      Ok(opt_val) => match opt_val {
+        Some(val) => deserialize_cached_response(&val, now),
+        None => None,
+      },
+      Err(_) => None,
+    },
+  };
+}
+
+// stash-kv へキャッシュ応答を保存する。
+// 障害・容量超過・上限超過時は false を返し、エラーを無視する（オリジン応答の返却を妨げない）。
+pub fn cache_put(host: &String, port: Int, key: &Bytes, res_status: Int, headers: &List<Hdr>, body: &Bytes, ttl_sec: Int) -> Bool
+  intent "stash-kv へ応答を保存する。失敗・容量超過は false"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let target = host.clone();
+  let k = key.clone();
+  let now = clock.unix_seconds().unwrap_or(0);
+  let initial_age = extract_age(&headers);
+  let val_opt = serialize_cached_response(res_status, &headers, &body, now, initial_age);
+  if val_opt.is_none() {
+    return false;
+  }
+  let val = val_opt.unwrap_or(Bytes.new());
+  let frame_opt = encode_stash_put(&k, &val, ttl_sec);
+  if frame_opt.is_none() {
+    return false;
+  }
+  let frame = frame_opt.unwrap_or(Bytes.new());
+  let talk_res = task.timeout(1000, move || {
+    match net.connect(&target, port) {
+      Err(_) => {
+        return None;
+      }
+      Ok(c0) => {
+        let mut conn = c0;
+        return stash_talk(&mut conn, &frame);
+      }
+    }
+  });
+  let opt_payload = talk_res.unwrap_or(None);
+  return match opt_payload {
+    None => false,
+    Some(payload) => match parse_stash_response(&payload) {
+      Ok(opt_val) => opt_val.is_some(),
+      Err(_) => false,
+    },
+  };
+}
+
+// stash-kv からキーを削除（無効化）する。
+// 障害・タイムアウト・エラー時は false を返し、エラーを無視する（オリジン応答の返却を妨げない）。
+pub fn cache_delete(host: &String, port: Int, key: &Bytes) -> Bool
+  intent "stash-kv からキーを削除（無効化）する。失敗時は false"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let target = host.clone();
+  let k = key.clone();
+  let frame = encode_stash_delete(&k);
+  let talk_res = task.timeout(1000, move || {
+    match net.connect(&target, port) {
+      Err(_) => {
+        return None;
+      }
+      Ok(c0) => {
+        let mut conn = c0;
+        return stash_talk(&mut conn, &frame);
+      }
+    }
+  });
+  let opt_payload = talk_res.unwrap_or(None);
+  return match opt_payload {
+    None => false,
+    Some(payload) => match parse_stash_response(&payload) {
+      Ok(opt_val) => opt_val.is_some(),
+      Err(_) => false,
+    },
+  };
+}
+
+// 要求メソッドが非安全（変更を伴う可能性がある）か判定する（RFC 9110: GET, HEAD, OPTIONS, TRACE 以外）。
+pub fn is_unsafe_method(method: &String) -> Bool
+  intent "要求メソッドが非安全（変更を伴う可能性がある）か判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let m = lower_string(&method);
+  if m == "get" || m == "head" || m == "options" || m == "trace" {
+    return false;
+  }
+  return true;
+}
+
+// 要求からキャッシュキーを取り出す。
+pub fn request_cache_key(prefix: &String, req: &HttpRequest) -> Option<Bytes>
+  intent "要求からキャッシュキーを導出する"
+  requires none
+  ensures none
+  effects none
+{
+  let host = request_host(&req);
+  return make_cache_key(&prefix, &host, &req.path(), &req.query());
+}
+
+// 応答からヘッダ一覧を取り出す。
+pub fn extract_headers(res: &HttpResponse) -> List<Hdr>
+  intent "HttpResponse から Hdr の一覧を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let all = res.headers();
+  let mut out = List.new();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        out.push(hdr(&lower_string(&h.name()), &h.value()));
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 要求が条件付きヘッダ（If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since, If-Range）を含むか判定する。
+pub fn is_conditional_request(req: &HttpRequest) -> Bool
+  intent "要求が条件付きヘッダを含むか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let all = req.headers();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        let name = lower_string(&h.name());
+        if name == "if-match" || name == "if-none-match" || name == "if-modified-since" || name == "if-unmodified-since" || name == "if-range" {
+          return true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// 経路と要求から、キャッシュ取得を試みる（キャッシュ無効またはミス・鮮度制約未達・障害は None）。
+// 要求の max-age=0 は再検証不可のため保守的に迂回。max-age=N / min-fresh=M は現行 Age と照合。
+// 条件付き要求（If-Match / If-None-Match 等）も上流で判定させるためキャッシュ取得を迂回。
+pub fn try_cache_get(route: &Route, req: &HttpRequest) -> Option<HttpResponse>
+  intent "経路でキャッシュが有効なら取得を試みる。ミス・共有不可・鮮度制約未達・条件付き要求・障害は None"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut cfg = cache_config(&"", 0, 0);
+  match route.cache.clone() {
+    None => {
+      return None;
+    }
+    Some(c) => {
+      cfg = c;
+    }
+  }
+  if !request_cacheable(&req) {
+    return None;
+  }
+  if is_conditional_request(&req) {
+    // 再検証が未実装のため、条件付き要求（If-Match / If-None-Match 等）は
+    // キャッシュ取得を迂回して上流へ転送し、上流による 304 / 412 判定を行わせる。
+    return None;
+  }
+  let policy = parse_request_cache_control(&req);
+  match policy.max_age {
+    Some(ma) => {
+      if ma == 0 {
+        // 再検証（304 による条件付き GET）が実装されていないため、
+        // max-age=0 の要求はキャッシュ取得を保守的に迂回してオリジンへ送る。
+        return None;
+      }
+    }
+    None => {}
+  }
+  let mut key = Bytes.new();
+  match request_cache_key(&route.prefix, &req) {
+    None => {
+      return None;
+    }
+    Some(k) => {
+      key = k;
+    }
+  }
+  let opt_res = cache_get(&cfg.backend_host, cfg.backend_port, &key);
+  match opt_res {
+    None => {
+      return None;
+    }
+    Some(res) => {
+      let hdrs = extract_headers(&res);
+      let current_age = extract_age(&hdrs);
+      match policy.max_age {
+        Some(ma) => {
+          if current_age > ma {
+            return None;
+          }
+        }
+        None => {}
+      }
+      match policy.min_fresh {
+        Some(mf) => {
+          let freshness = response_freshness_lifetime(&hdrs, cfg.ttl_sec);
+          if freshness <= 0 || freshness - current_age < mf {
+            return None;
+          }
+        }
+        None => {}
+      }
+      return Some(res);
+    }
+  }
+}
+
+// 経路と要求・応答から、キャッシュ保存を試みる（キャッシュ無効または共有不可・上限超過・障害は無視）。
+pub fn try_cache_put(route: &Route, req: &HttpRequest, res: &HttpResponse)
+  intent "経路でキャッシュが有効なら保存を試みる。共有不可・上限超過・障害時は素通り"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut cfg = cache_config(&"", 0, 0);
+  match route.cache.clone() {
+    None => {
+      return;
+    }
+    Some(c) => {
+      cfg = c;
+    }
+  }
+  if !request_cacheable(&req) {
+    return;
+  }
+  let mut key = Bytes.new();
+  match request_cache_key(&route.prefix, &req) {
+    None => {
+      return;
+    }
+    Some(k) => {
+      key = k;
+    }
+  }
+  let hdrs = extract_headers(&res);
+  let ttl_opt = response_cacheable(res.status(), &hdrs, cfg.ttl_sec);
+  match ttl_opt {
+    None => {}
+    Some(ttl) => {
+      let _ = cache_put(&cfg.backend_host, cfg.backend_port, &key, res.status(), &hdrs, &res.body(), ttl);
+    }
+  }
+}
+
+// 経路と変更要求・応答状態から、キャッシュ無効化（削除）を試みる（RFC 9111 Section 4.4: 200-399 成功時）。
+pub fn try_cache_invalidate(route: &Route, req: &HttpRequest, res_status: Int)
+  intent "変更要求（POST/PUT/DELETE等）が成功（200-399）した後に、対象 URI のキャッシュを無効化する"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  if !is_unsafe_method(&req.method()) {
+    return;
+  }
+  if res_status < 200 || res_status >= 400 {
+    return;
+  }
+  let mut cfg = cache_config(&"", 0, 0);
+  match route.cache.clone() {
+    None => {
+      return;
+    }
+    Some(c) => {
+      cfg = c;
+    }
+  }
+  let mut key = Bytes.new();
+  match request_cache_key(&route.prefix, &req) {
+    None => {
+      return;
+    }
+    Some(k) => {
+      key = k;
+    }
+  }
+  let _ = cache_delete(&cfg.backend_host, cfg.backend_port, &key);
+}

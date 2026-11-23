@@ -66,7 +66,36 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 - `X-Forwarded-For` は、直接の接続元の IP を上流へ渡す（信頼する接続元には、届いた値の後ろに `, 接続元` と追記。信頼しない接続元の値は捨てて接続元の IP だけにする）。`Forwarded` / `X-Real-IP` は常に捨てる。`X-Forwarded-Proto` は信頼しない接続元には常に `http` で上書き（信頼する接続元は `https` のみ中継）。`trusted_proxies`（IPv4 / IPv4 CIDR / IPv6 単一アドレス。既定はループバック）は起動時に検査する。
 - 応答は全体を読んでから返す（ストリーミングなし。上流の応答は `Content-Length`・チャンク・接続の切断のどれかで終わりを決める。`Content-Length` と `Transfer-Encoding` の併記、食い違う `Content-Length`、1xx、未対応の転送符号は 502）。応答の解釈は sigix の中の最小実装（`sigix/respparse.sigil`。言語側に `HttpResponseParser` が入ったら置き換える）。
 - 条件付き GET: 静的ファイルに `ETag`（大きさと更新時刻から作る強い検証子）と `Last-Modified` を付け、`If-None-Match`（優先）・`If-Modified-Since`（IMF-fixdate のみ）が合えば本文を読まずに 304。`File.byte_len` / `File.mtime`（sigil ADR 0049 決定 8）を使う。
-- アクセスログはプロキシの経路だけ末尾に `転送先 上流の状態` が付く: `1763784000 GET /api/v1/users HTTP/1.1 200 1024 127.0.0.1:9000 200`。502 のときの上流の状態は `-`。
+- アクセスログはプロキシの経路だけ末尾に `転送先 上流の状態` が付く: `1763784000 GET /api/v1/users HTTP/1.1 200 1024 127.0.0.1:9000 200`。502 のときの上流の状態は `-`。キャッシュヒット時は転送先が `cache` になる。
+
+## 任意のキャッシュ連携（ADR 0059 段 4）
+
+プロキシ経路ごとに `sigil-stash-kv` とのキャッシュ連携を任意で有効化できる。
+
+```json
+{
+  "prefix": "/api/",
+  "type": "proxy",
+  "backends": ["127.0.0.1:9000"],
+  "cache": {
+    "backend": "127.0.0.1:6379",
+    "ttl_sec": 60
+  }
+}
+```
+
+- `backend`: `sigil-stash-kv` の待受 `IP:ポート`（数値アドレスのみ）。
+- `ttl_sec`: 応答の `Cache-Control` に明示的な `s-maxage` や `max-age` がなく `public` の場合に使う既定の TTL 秒数（1〜86400、既定値 60）。
+- **キャッシュキー**: `prefix + ":" + host + ":" + path + ("?" + query)`（上限 512 バイト）。
+- **キャッシュ可否の判定**:
+  - 要求: `GET` のみ。`Authorization` または `Cookie` がある要求、`Cache-Control: no-store` / `no-cache`（引数指定付きを含む）を含む要求、および `Cache-Control` が無く `Pragma: no-cache` を含む要求はキャッシュせず通過。`Cache-Control: max-age=0` は再検証不可のためキャッシュ取得を保守的に迂回。`max-age` / `min-fresh` 制約は現行 Age および残余鮮度と照合し未達時は通過。`If-Match` / `If-None-Match` 等の条件付き要求は上流で判定させるためキャッシュ取得を迂回。
+  - 応答: 状態コード `200` のみ。`Set-Cookie` または `Vary` を含む応答、`Cache-Control: private` / `no-store` / `no-cache`（引数指定付きを含む）はキャッシュせず通過。
+  - 有効期限: 応答の現行 `Age` を考慮し、残余鮮度（`s-maxage` > `max-age` > `ttl_sec` から `Age` を減算）を計算。残余鮮度が 0 以下の stale な応答はキャッシュせず通過。
+  - 上限: 直列化後の応答サイズは 3072 バイト以下。超過時はキャッシュせず通過。
+- **キャッシュヒット時の Age 更新**: 保存時の時刻および初期 Age メタデータを保持し、キャッシュヒット応答には経過時間を反映した現行の `Age` ヘッダを付与して返却。
+- **変更成功後のキャッシュ無効化**: 変更メソッド（`POST` / `PUT` / `DELETE` / `PATCH` 等の非安全メソッド）で成功（状態コード 200〜399）した要求の通過後、対象 URI のキャッシュエントリを無効化（削除）。
+- **フォールバック**: キャッシュミス、TTL 期限切れ、キー・値の上限超過、`sigil-stash-kv` の容量超過や接続・通信障害時は、安全にオリジンから取得してクライアントへ返す（クライアントへ 502 等のエラーを出さない）。
+- 静的配信経路（`type: "static"`）への `cache` 指定は設定エラーとなる（fail-closed）。
 
 ## 既知の制約・範囲外
 
@@ -84,5 +113,5 @@ Sigil にはまだ argv を直接受ける API が無いため、引数は 1 つ
 SIGIL=/path/to/sigil ./test.sh
 ```
 
-`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 16 件。後者は python3 で上流を 2 台立てる）を順に実行する。
+`sigil fmt --check`、`sigil check`、SIR 評価器での単体テスト、ネイティブ単体テスト、ネイティブバイナリへの curl 結合テスト（静的配信 `tests/e2e.sh` 55 件、プロキシ `tests/e2e_proxy.sh` 16 件、キャッシュ `tests/e2e_cache.sh` 25 件）を順に実行する。
 CI は sigil の main コミットを固定してコンパイラをビルドし、同じ `test.sh` を実行する（`.github/workflows/ci.yml`）。
