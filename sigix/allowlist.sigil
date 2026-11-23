@@ -1,0 +1,117 @@
+module sigix.allowlist
+  targets server
+  trust none
+
+use sigix.text.find_from;
+use sigix.text.lower_string;
+use sigix.text.parse_dec;
+use sigix.text.sub;
+
+// 信頼する接続元の判定（ADR 0056 決定 6）。許可リストの項目は routes.trusted_ok で検査済みの形:
+// IPv4（`a.b.c.d` または `a.b.c.d/n`、n は 0〜32）、IPv6 の単一アドレス。
+// IPv6 は小文字にそろえた文字列の完全一致（カーネルが返す正規の表記と、設定の表記が同じ形のときだけ一致する）。
+
+fn ipv4_value(s: &String) -> Int
+  intent "ドット区切りの IPv4 を 32 ビットの整数にする（形が違えば -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut value = 0;
+  let mut parts = 0;
+  let mut start = 0;
+  let mut i = 0;
+  while i <= b.byte_len() {
+    if i == b.byte_len() || b.get(i).unwrap_or(0) == 46 {
+      match parse_dec(&sub(&b, start, i)) {
+        None => {
+          return 0 - 1;
+        }
+        Some(n) => {
+          if n > 255 {
+            return 0 - 1;
+          }
+          value = value * 256 + n;
+        }
+      }
+      parts = parts + 1;
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  if parts != 4 {
+    return 0 - 1;
+  }
+  return value;
+}
+
+fn matches_entry(ip: &String, entry: &String) -> Bool
+  intent "接続元 IP が、許可リストの 1 項目に一致するか"
+  requires none
+  ensures none
+  effects none
+{
+  let slash = find_from(&entry.as_bytes(), &"/".as_bytes(), 0);
+  if slash < 0 {
+    let a = ipv4_value(&ip);
+    let e = ipv4_value(&entry);
+    if a >= 0 && e >= 0 {
+      return a == e;
+    }
+    return lower_string(&ip) == lower_string(&entry);
+  }
+  let base = sub(&entry.as_bytes(), 0, slash).to_string_utf8().unwrap_or("");
+  let bits = parse_dec(&sub(&entry.as_bytes(), slash + 1, entry.byte_len())).unwrap_or(0 - 1);
+  let a = ipv4_value(&ip);
+  let e = ipv4_value(&base);
+  if a < 0 || e < 0 || bits < 0 || bits > 32 {
+    return false;
+  }
+  let mut size = 1;
+  let mut k = 0;
+  while k < 32 - bits {
+    size = size * 2;
+    k = k + 1;
+  }
+  return a / size == e / size;
+}
+
+pub fn normalize_peer(ip: &String) -> String
+  intent "IPv4 射影アドレス（::ffff:a.b.c.d）を IPv4 の表記にそろえる。それ以外はそのまま"
+  requires none
+  ensures none
+  effects none
+{
+  let lower = lower_string(&ip);
+  let prefix = "::ffff:".as_bytes();
+  let b = lower.as_bytes();
+  if b.byte_len() > prefix.byte_len() && sub(&b, 0, prefix.byte_len()) == prefix {
+    let rest = sub(&b, prefix.byte_len(), b.byte_len()).to_string_utf8().unwrap_or("");
+    if ipv4_value(&rest) >= 0 {
+      return rest;
+    }
+  }
+  return lower;
+}
+
+pub fn is_trusted(ip: &String, trusted: &List<String>) -> Bool
+  intent "接続元 IP が許可リストのどれかに一致するか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < trusted.len() {
+    match trusted.get(i) {
+      None => {}
+      Some(entry) => {
+        if matches_entry(&ip, &entry) {
+          return true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}

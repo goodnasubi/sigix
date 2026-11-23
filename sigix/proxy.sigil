@@ -1,0 +1,394 @@
+module sigix.proxy
+  targets server
+  trust none
+
+use sigix.headers.Hdr;
+use sigix.headers.Source;
+use sigix.headers.client_headers;
+use sigix.headers.hdr;
+use sigix.headers.upstream_headers;
+use sigix.respparse.Upstream;
+use sigix.respparse.chunked_done;
+use sigix.respparse.expected_total;
+use sigix.respparse.head_end;
+use sigix.respparse.head_limit;
+use sigix.respparse.is_chunked;
+use sigix.respparse.parse_response;
+use sigix.routes.Backend;
+use sigix.routes.Route;
+use sigix.text.decimal;
+use sigix.text.find_from;
+use sigix.text.lower_string;
+
+// リバースプロキシ（ADR 0056 決定 6）。要求を解釈して組み直し、上流へ `Connection: close` の HTTP/1.1 で送り、
+// 応答全体を読んでから解釈し直して返す（ストリーミングはしない。応答本文は max_body まで）。
+// 接続できない・時間切れ・応答が読めない・上限超過はすべて固定本文の 502 にする（上流の内部情報は返さない）。
+
+pub struct Proxied {
+  res: HttpResponse,
+  backend: String,
+  upstream: Int,
+}
+
+fn bad_gateway() -> HttpResponse
+  intent "固定本文の 502 Bad Gateway"
+  requires none
+  ensures none
+  effects none
+{
+  return HttpResponse.new(502, "Bad Gateway\n".as_bytes()).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
+}
+
+fn bad_request() -> HttpResponse
+  intent "固定本文の 400 Bad Request"
+  requires none
+  ensures none
+  effects none
+{
+  return HttpResponse.new(400, "Bad Request\n".as_bytes()).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
+}
+
+pub fn backend_text(b: &Backend) -> String
+  intent "転送先を `ホスト:ポート` の文字列にする（IPv6 は角括弧つき）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let colon = find_from(&b.host.as_bytes(), &":".as_bytes(), 0) >= 0;
+  if colon {
+    out.push(91);
+  }
+  out.extend(&b.host.as_bytes());
+  if colon {
+    out.push(93);
+  }
+  out.push(58);
+  out.extend(&decimal(b.port));
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn target_ok(b: &Bytes) -> Bool
+  intent "要求行に入れてよい経路か（空白・制御文字・DEL を含まない）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c <= 32 || c == 127 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn token_ok(m: &String) -> Bool
+  intent "メソッドとして要求行に入れてよいか（英大文字だけ）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = m.as_bytes();
+  if b.byte_len() == 0 || b.byte_len() > 16 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c < 65 || c > 90 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn request_headers(req: &HttpRequest) -> List<Hdr>
+  intent "要求のヘッダを、名前を小文字にそろえた一覧にする"
+  requires none
+  ensures none
+  effects none
+{
+  let all = req.headers();
+  let mut out = List.new();
+  let mut i = 0;
+  while i < all.len() {
+    match all.get(i) {
+      None => {}
+      Some(h) => {
+        out.push(hdr(&lower_string(&h.name()), &h.value()));
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 上流へ送る要求の全体（要求行・ヘッダ・本文）。Host / X-Forwarded-* は headers.upstream_headers が決める。
+// 経路は届いたまま（接頭辞は取り除かない）。None は要求行に入れられない値を含むとき。
+pub fn build_request(req: &HttpRequest, src: &Source, route: &Route, backend: &Backend) -> Option<Bytes>
+  intent "要求を解釈し直して、上流へ送る HTTP/1.1 の要求を組み立てる"
+  requires none
+  ensures none
+  effects none
+{
+  let method = req.method();
+  let path = req.path();
+  let query = req.query();
+  if !token_ok(&method) || !target_ok(&path) || !target_ok(&query) || path.byte_len() == 0 {
+    return None;
+  }
+  let hs = upstream_headers(&request_headers(&req), &src, &route.host_mode, &backend_text(&backend));
+  let mut out = Bytes.new();
+  out.extend(&method.as_bytes());
+  out.push(32);
+  out.extend(&path);
+  if query.byte_len() > 0 {
+    out.push(63);
+    out.extend(&query);
+  }
+  out.extend(&" HTTP/1.1\r\n".as_bytes());
+  let mut i = 0;
+  while i < hs.len() {
+    match hs.get(i) {
+      None => {}
+      Some(h) => {
+        out.extend(&h.name.as_bytes());
+        out.extend(&": ".as_bytes());
+        out.extend(&h.value);
+        out.extend(&"\r\n".as_bytes());
+      }
+    }
+    i = i + 1;
+  }
+  let body = req.body();
+  if body.byte_len() > 0 || method == "POST" || method == "PUT" || method == "PATCH" {
+    out.extend(&"content-length: ".as_bytes());
+    out.extend(&decimal(body.byte_len()));
+    out.extend(&"\r\n".as_bytes());
+  }
+  out.extend(&"connection: close\r\n\r\n".as_bytes());
+  out.extend(&body);
+  return Some(out);
+}
+
+fn int_at(l: &List<Int>, i: Int) -> Int
+  intent "一覧の i 番目（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v + 0,
+    None => 0,
+  };
+}
+
+pub fn next_backend(cursors: &Lock<List<Int>>, route_index: Int, count: Int) -> Int
+  intent "ラウンドロビン: 経路ごとの巡回位置を 1 つ進め、使う転送先の番号を返す（接続をまたいで共有する）"
+  requires 1 <= count
+  ensures none
+  effects task.share, task.suspend
+{
+  match cursors.acquire() {
+    Err(_) => {
+      return 0;
+    }
+    Ok(g0) => {
+      let mut g = g0;
+      let before = int_at(g.get(), route_index);
+      let mut next = List.new();
+      let mut i = 0;
+      let len = g.get().len();
+      while i < len {
+        let v = int_at(g.get(), i);
+        if i == route_index {
+          next.push((v + 1) % count);
+        } else {
+          next.push(v);
+        }
+        i = i + 1;
+      }
+      let m = g.get_mut();
+      m = next;
+      return before % count;
+    }
+  }
+}
+
+pub fn initial_cursors(route_count: Int) -> List<Int>
+  intent "巡回位置の初期値（すべて 0）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  let mut i = 0;
+  while i < route_count {
+    l.push(0);
+    i = i + 1;
+  }
+  return l;
+}
+
+// 接続済みの上流へ要求を送り、応答全体を読む。空の Bytes は失敗（書き込み・読み取りの失敗、上限超過）。時間の制限は呼び出し側。
+fn converse(c: &mut TcpClient, wire: &Bytes, no_body: Bool, max_body: Int) -> Bytes
+  intent "接続済みの上流へ要求を書き込み、応答を（終わりが分かるまで、または切断まで）読む。失敗は空の Bytes"
+  requires 0 <= max_body
+  ensures none
+  effects net.client, task.suspend
+{
+  match c.write_all(&wire) {
+    Err(_) => {
+      return Bytes.new();
+    }
+    Ok(_) => {}
+  }
+  let mut buf = Bytes.new();
+  let mut head_seen = false;
+  let mut expect = 0 - 1;
+  let mut limit = max_body + 131072;
+  let mut chunked = false;
+  let mut done = false;
+  let mut bad = false;
+  while !done {
+    match c.read(16384) {
+      Err(_) => {
+        bad = true;
+        done = true;
+      }
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          done = true;
+        } else {
+          buf.extend(&chunk);
+          if buf.byte_len() > limit {
+            bad = true;
+            done = true;
+          } else {
+            if !head_seen {
+              if head_end(&buf, 0) >= 0 {
+                head_seen = true;
+                expect = expected_total(&buf, no_body);
+                if is_chunked(&buf) {
+                  chunked = true;
+                  limit = max_body * 7 + 131072;
+                }
+              } else {
+                if buf.byte_len() > head_limit() {
+                  bad = true;
+                  done = true;
+                }
+              }
+            }
+            if expect >= 0 && buf.byte_len() >= expect {
+              done = true;
+            }
+            if chunked && !done && chunked_done(&buf) {
+              done = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  if bad {
+    return Bytes.new();
+  }
+  return buf;
+}
+
+// 上流へ送って応答全体を読む。空の Bytes は失敗（接続不可・時間切れ・読み取り失敗・上限超過）。
+fn exchange(host: String, port: Int, wire: Bytes, no_body: Bool, max_body: Int, connect_ms: Int, read_ms: Int) -> Bytes
+  intent "上流へ接続し（connect_ms 以内）、要求を送って応答を読む（接続の成功後 read_ms 以内。接続の所要時間とは独立）。失敗は空の Bytes"
+  requires 1 <= connect_ms && 1 <= read_ms
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  // 外側の締め切り connect_ms + read_ms は上限。接続は connect_ms、接続後のやり取りは別に read_ms で区切る。
+  let whole = task.timeout(connect_ms + read_ms, move || {
+    let target = host.clone();
+    let connected = task.timeout(connect_ms, move || net.connect(&target, port));
+    match connected {
+      None => {
+        return Bytes.new();
+      }
+      Some(r) => {
+        match r {
+          Err(_) => {
+            return Bytes.new();
+          }
+          Ok(c0) => {
+            let mut conn = c0;
+            let w = wire.clone();
+            let talked = task.timeout(read_ms, move || converse(&mut conn, &w, no_body, max_body));
+            return talked.unwrap_or(Bytes.new());
+          }
+        }
+      }
+    }
+  });
+  return whole.unwrap_or(Bytes.new());
+}
+
+// 上流の応答をクライアントへ返す応答に直す。
+pub fn to_response(up: &Upstream) -> HttpResponse
+  intent "上流の応答（状態・ヘッダ・本文）から、クライアントへ返す応答を作る（ホップバイホップ等は取り除く）"
+  requires none
+  ensures none
+  effects none
+{
+  let hs = client_headers(&up.headers);
+  let mut res = HttpResponse.new(up.status, up.body.clone());
+  let mut i = 0;
+  while i < hs.len() {
+    match hs.get(i) {
+      None => {}
+      Some(h) => {
+        res = res.with_header(&h.name, &h.value);
+      }
+    }
+    i = i + 1;
+  }
+  return res;
+}
+
+pub fn forward(req: &HttpRequest, src: &Source, route: &Route, route_index: Int, cursors: &Lock<List<Int>>, connect_ms: Int, read_ms: Int, max_body: Int) -> Proxied
+  intent "要求を、ラウンドロビンで選んだ転送先へ組み直して送り、応答を返す。失敗は 502"
+  requires 1 <= connect_ms && 1 <= read_ms && 1 <= max_body
+  ensures none
+  effects clock, net.client, task
+{
+  let n = route.backends.len();
+  if n < 1 {
+    return Proxied { res: bad_gateway(), backend: "-", upstream: 0 };
+  }
+  let at = next_backend(&cursors, route_index, n);
+  match route.backends.get(at) {
+    None => {
+      return Proxied { res: bad_gateway(), backend: "-", upstream: 0 };
+    }
+    Some(b) => {
+      let name = backend_text(&b);
+      match build_request(&req, &src, &route, &b) {
+        None => {
+          return Proxied { res: bad_request(), backend: "-", upstream: 0 };
+        }
+        Some(wire) => {
+          let no_body = req.method() == "HEAD";
+          let buf = exchange(b.host.clone(), b.port, wire, no_body, max_body, connect_ms, read_ms);
+          if buf.byte_len() == 0 {
+            return Proxied { res: bad_gateway(), backend: name, upstream: 0 };
+          }
+          return match parse_response(&buf, no_body, max_body) {
+            None => Proxied { res: bad_gateway(), backend: name, upstream: 0 },
+            Some(up) => Proxied { res: to_response(&up), backend: name, upstream: up.status },
+          };
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,105 @@
+module sigix.app
+  targets server
+  trust none
+
+use sigix.allowlist.is_trusted;
+use sigix.allowlist.normalize_peer;
+use sigix.headers.source;
+use sigix.proxy.forward;
+use sigix.routes.Settings;
+use sigix.routes.find_route;
+use sigix.serve.access_line;
+use sigix.serve.static_response;
+use sigix.text.decimal;
+use sigix.text.sub;
+
+// 経路接頭辞で静的配信とリバースプロキシを振り分ける（ADR 0056 決定 6）。
+// アクセスログは段階 1 の項目に、プロキシのときだけ `転送先 上流の状態` を足す（失敗は上流の状態が `-`、経路が合わなければ足さない）。
+
+fn plain_404() -> HttpResponse
+  intent "どの経路にも合わない要求への定型の 404"
+  requires none
+  ensures none
+  effects none
+{
+  return HttpResponse.new(404, "Not Found\n".as_bytes()).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
+}
+
+fn log_line(req: &HttpRequest, res: &HttpResponse, backend: &String, upstream: Int) -> String
+  intent "アクセスログ 1 行（プロキシのときは転送先と上流の状態を末尾に足す）"
+  requires none
+  ensures none
+  effects clock
+{
+  let now = clock.unix_seconds().unwrap_or(0);
+  let base = access_line(now, &req, &res);
+  if backend == "" {
+    return base;
+  }
+  let mut line = base.as_bytes();
+  line.push(32);
+  line.extend(&backend.as_bytes());
+  line.push(32);
+  if upstream > 0 {
+    line.extend(&decimal(upstream));
+  } else {
+    line.push(45);
+  }
+  return line.to_string_utf8().unwrap_or(base);
+}
+
+// 接頭辞を除いた、公開ルート内の経路（`/` で始まる）。
+fn rest_of(path: &Bytes, prefix_len: Int) -> Bytes
+  intent "経路から接頭辞（末尾の `/` を除いた長さ）を除く。結果は `/` で始まる"
+  requires none
+  ensures none
+  effects none
+{
+  return sub(&path, prefix_len, path.byte_len());
+}
+
+pub fn handle(settings: &Settings, cursors: &Lock<List<Int>>, max_body: Int, peer: &Option<String>, req: &HttpRequest) -> HttpResponse
+  intent "要求を経路接頭辞で静的配信かプロキシに振り分けて応答を返し、アクセスログを 1 行出す"
+  requires 1 <= max_body
+  ensures none
+  effects clock, console, fs, net.client, task
+{
+  let path = req.path();
+  match find_route(&settings, &path) {
+    None => {
+      let res = plain_404();
+      console.log(&log_line(&req, &res, &"", 0));
+      return res;
+    }
+    Some(idx) => {
+      match settings.routes.get(idx) {
+        None => {
+          let res = plain_404();
+          console.log(&log_line(&req, &res, &"", 0));
+          return res;
+        }
+        Some(route) => {
+          if route.proxy {
+            // 接続元の IP（`TcpStream.peer_addr`、sigil #721）を許可リストと照合する。取れなかったときは不明（信頼しない）。
+            let mut src = source(false, &None);
+            match peer {
+              None => {}
+              Some(text) => {
+                let ip = normalize_peer(&text);
+                let trusted = is_trusted(&ip, &settings.trusted);
+                src = source(trusted, &Some(ip));
+              }
+            }
+            let done = forward(&req, &src, &route, idx, &cursors, settings.connect_ms, settings.read_ms, max_body);
+            console.log(&log_line(&req, &done.res, &done.backend, done.upstream));
+            return done.res;
+          }
+          let rel = rest_of(&path, route.prefix.byte_len() - 1);
+          let res = static_response(&route.root, max_body, &req, &rel, &path);
+          console.log(&log_line(&req, &res, &"", 0));
+          return res;
+        }
+      }
+    }
+  }
+}

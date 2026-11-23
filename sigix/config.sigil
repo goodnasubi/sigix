@@ -8,6 +8,7 @@ module sigix.config
 //   --listen ADDR:PORT        環境変数 SIGIX_LISTEN             既定 127.0.0.1:8080（IPv6 は [::1]:8080）
 //   --root DIR                環境変数 SIGIX_ROOT               必須（既定なし）
 //   --max-response-body BYTES 環境変数 SIGIX_MAX_RESPONSE_BODY  既定 1048576、範囲 1〜67108864
+//   --config FILE             環境変数 SIGIX_CONFIG             JSON の設定ファイル（段階 2。経路・プロキシ。sigix.routes を参照）
 //
 // 値は `--name value` と `--name=value` のどちらでも渡せる。
 
@@ -16,6 +17,9 @@ pub struct Config {
   port: Int,
   root: String,
   max_body: Int,
+  config: String,
+  listen_set: Bool,
+  max_set: Bool,
 }
 
 fn is_digit(c: Int) -> Bool
@@ -145,7 +149,7 @@ pub fn parse_listen(s: &String) -> Option<Config>
       if port < 1 || port > 65535 {
         return None;
       }
-      return Some(Config { host: host, port: port, root: "", max_body: 0 });
+      return Some(Config { host: host, port: port, root: "", max_body: 0, config: "", listen_set: false, max_set: false });
     }
   }
 }
@@ -210,6 +214,7 @@ struct Given {
   listen: Option<String>,
   root: Option<String>,
   max_body: Option<String>,
+  config: Option<String>,
 }
 
 fn read_args(args: &List<String>) -> Result<Given, String>
@@ -218,7 +223,7 @@ fn read_args(args: &List<String>) -> Result<Given, String>
   ensures none
   effects none
 {
-  let mut given = Given { listen: None, root: None, max_body: None };
+  let mut given = Given { listen: None, root: None, max_body: None, config: None };
   let mut i = 0;
   while i < args.len() {
     let a = match args.get(i) {
@@ -260,7 +265,14 @@ fn read_args(args: &List<String>) -> Result<Given, String>
           }
           given.max_body = Some(value);
         } else {
-          return Err("sigix: 不明なオプションです（--listen / --root / --max-response-body のみ）");
+          if name == "config" {
+            if given.config.is_some() {
+              return Err("sigix: --config が重複しています");
+            }
+            given.config = Some(value);
+          } else {
+            return Err("sigix: 不明なオプションです（--listen / --root / --max-response-body / --config のみ）");
+          }
         }
       }
     }
@@ -271,12 +283,22 @@ fn read_args(args: &List<String>) -> Result<Given, String>
 
 // 起動引数と環境変数の値から設定を組み立てる（副作用なし。環境変数の読み出しは呼び出し側）。
 pub fn resolve(args: &List<String>, env_listen: Option<String>, env_root: Option<String>, env_max: Option<String>) -> Result<Config, String>
+  intent "段階 1 の互換: 設定ファイルの環境変数なしで設定を決める"
+  requires none
+  ensures none
+  effects none
+{
+  return resolve_with(&args, env_listen, env_root, env_max, None);
+}
+
+pub fn resolve_with(args: &List<String>, env_listen: Option<String>, env_root: Option<String>, env_max: Option<String>, env_config: Option<String>) -> Result<Config, String>
   intent "起動引数 > 環境変数 > 既定値の順で設定を決め、不正・範囲外の値は Err にする"
   requires none
   ensures none
   effects none
 {
   let given = read_args(&args)?;
+  let listen_set = given.listen.is_some() || env_listen.is_some();
   let listen_text = match given.listen {
     Some(v) => v,
     None => env_listen.unwrap_or("127.0.0.1:8080"),
@@ -284,6 +306,10 @@ pub fn resolve(args: &List<String>, env_listen: Option<String>, env_root: Option
   let root_text = match given.root {
     Some(v) => v,
     None => env_root.unwrap_or(""),
+  };
+  let config_text = match given.config {
+    Some(v) => v,
+    None => env_config.unwrap_or(""),
   };
   let max_given = given.max_body.is_some() || env_max.is_some();
   let max_default = http.default_limits().response_body();
@@ -298,9 +324,15 @@ pub fn resolve(args: &List<String>, env_listen: Option<String>, env_root: Option
   if parsed.is_none() {
     return Err("sigix: --listen / SIGIX_LISTEN が不正です（例: 127.0.0.1:8080、[::1]:8080。ポートは 1〜65535）");
   }
-  let listen = parsed.unwrap_or(Config { host: "", port: 0, root: "", max_body: 0 });
-  if root_text.byte_len() == 0 || root_text.as_bytes().get(0).unwrap_or(0) == 0 {
-    return Err("sigix: --root / SIGIX_ROOT が必要です");
+  let listen = parsed.unwrap_or(Config { host: "", port: 0, root: "", max_body: 0, config: "", listen_set: false, max_set: false });
+  if root_text.byte_len() == 0 && config_text.byte_len() == 0 {
+    return Err("sigix: --root / SIGIX_ROOT（または --config / SIGIX_CONFIG）が必要です");
+  }
+  if root_text.byte_len() > 0 && root_text.as_bytes().get(0).unwrap_or(0) == 0 {
+    return Err("sigix: --root / SIGIX_ROOT が不正です");
+  }
+  if config_text.as_bytes().get(0).unwrap_or(1) == 0 {
+    return Err("sigix: --config / SIGIX_CONFIG が不正です");
   }
   let mut max_body = max_default;
   if max_text.byte_len() > 0 {
@@ -316,7 +348,7 @@ pub fn resolve(args: &List<String>, env_listen: Option<String>, env_root: Option
   if max_body < 1 || max_body > 67108864 {
     return Err("sigix: --max-response-body / SIGIX_MAX_RESPONSE_BODY が範囲外です（1〜67108864）");
   }
-  return Ok(Config { host: listen.host, port: listen.port, root: root_text, max_body: max_body });
+  return Ok(Config { host: listen.host, port: listen.port, root: root_text, max_body: max_body, config: config_text, listen_set: listen_set, max_set: max_given });
 }
 
 pub fn load_config(args: &List<String>) -> Result<Config, String>
@@ -325,5 +357,5 @@ pub fn load_config(args: &List<String>) -> Result<Config, String>
   ensures none
   effects env
 {
-  return resolve(&args, env.get(&"SIGIX_LISTEN"), env.get(&"SIGIX_ROOT"), env.get(&"SIGIX_MAX_RESPONSE_BODY"));
+  return resolve_with(&args, env.get(&"SIGIX_LISTEN"), env.get(&"SIGIX_ROOT"), env.get(&"SIGIX_MAX_RESPONSE_BODY"), env.get(&"SIGIX_CONFIG"));
 }

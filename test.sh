@@ -49,4 +49,7 @@ echo "=== 5. Building sigix and running end-to-end tests ==="
 $SIGIL build --root . main.sigil main -o "$TMP_DIR/sigix"
 ./tests/e2e.sh "$TMP_DIR/sigix"
 
+echo "=== 6. Running reverse proxy end-to-end tests ==="
+./tests/e2e_proxy.sh "$TMP_DIR/sigix"
+
 echo "=== All tests passed successfully! Evaluator and native match verified. ==="
