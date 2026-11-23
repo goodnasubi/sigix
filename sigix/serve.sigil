@@ -1,0 +1,292 @@
+module sigix.serve
+  targets server
+  trust none
+
+use sigix.mime.mime_type;
+use sigix.target.Target;
+use sigix.target.decode_target;
+
+// 静的ファイル配信の要求処理（ADR 0056 決定 3・4、仕様詳細 段階 1）。
+// 経路の検査（第 1 防衛線）は sigix.target、ファイルの取得は必ず公開ルートを開いた `Dir` 起点（第 2 防衛線、ADR 0049）。
+
+// 1 回の読み出しの大きさ。応答本文の上限を超える分は読まない（超えた時点で中断する）。
+fn chunk_size() -> Int
+  intent "1 回の読み出しの大きさ（バイト）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16384;
+}
+
+enum Fetched {
+  Found(Bytes),
+  Missing,
+  Directory,
+  TooLarge,
+  Failed,
+}
+
+fn zero_chunk() -> Bytes
+  intent "16 KiB の 0 で埋めた読み出し用バッファを作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.push(0);
+  while buf.byte_len() < chunk_size() {
+    let copy = buf.clone();
+    buf.extend(&copy);
+  }
+  return buf;
+}
+
+fn fetch(dir: &Dir, rel: &String, max_body: Int) -> Fetched
+  intent "公開ルートの `Dir` 起点でファイルを開き、応答本文の上限までだけ読む。上限を超えたら全量を読まずに TooLarge"
+  requires 1 <= max_body
+  ensures none
+  effects fs
+{
+  let opts = OpenOptions.new().follow_symlinks(false);
+  match dir.open_file(&Path.new(&rel), &opts) {
+    Err(_) => {
+      return Fetched.Missing;
+    }
+    Ok(opened) => {
+      let mut file = opened;
+      match file.mode() {
+        Err(e) => {
+          let _ = file.close();
+          return match e {
+            IoError.IsADirectory(_) => Fetched.Directory,
+            _ => Fetched.Missing,
+          };
+        }
+        Ok(_) => {}
+      }
+      let mut buf = zero_chunk();
+      let mut body = Bytes.new();
+      let mut total = 0;
+      let mut verdict = 0;
+      let mut done = false;
+      while !done {
+        match file.read(&mut buf) {
+          Err(_) => {
+            verdict = 2;
+            done = true;
+          }
+          Ok(n) => {
+            if n == 0 {
+              done = true;
+            } else {
+              total = total + n;
+              if total > max_body {
+                verdict = 1;
+                done = true;
+              } else {
+                body.extend(&buf.slice(0, n).unwrap_or(Bytes.new()));
+              }
+            }
+          }
+        }
+      }
+      let _ = file.close();
+      if verdict == 1 {
+        return Fetched.TooLarge;
+      }
+      if verdict == 2 {
+        return Fetched.Failed;
+      }
+      return Fetched.Found(body);
+    }
+  }
+}
+
+fn plain(status: Int, text: &String) -> HttpResponse
+  intent "定型の本文だけを持つエラー応答。内部のパスや理由は含めない（ADR 0056 脅威と対策 5）"
+  requires 200 <= status && status <= 599
+  ensures none
+  effects none
+{
+  return HttpResponse.new(status, text.as_bytes()).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
+}
+
+fn ok_file(body: Bytes, name: &String) -> HttpResponse
+  intent "200 でファイルの本文を返す。Content-Type は拡張子の表で決める（Content-Length は std.http が付ける）"
+  requires none
+  ensures none
+  effects none
+{
+  let mime = mime_type(&name);
+  return HttpResponse.new(200, body).with_header(&"content-type", &mime.as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
+}
+
+fn index_of(rel: &String) -> String
+  intent "ディレクトリの相対パスから、その直下の index.html の相対パスを作る"
+  requires none
+  ensures none
+  effects none
+{
+  if rel.byte_len() == 0 {
+    return "index.html";
+  }
+  return rel.as_bytes().concat(&"/index.html".as_bytes()).to_string_utf8().unwrap_or("index.html");
+}
+
+fn lookup(dir: &Dir, target: &Target, raw_path: &Bytes, max_body: Int) -> HttpResponse
+  intent "検査済みの対象を、公開ルートの `Dir` 起点で応答にする"
+  requires 1 <= max_body
+  ensures none
+  effects fs
+{
+  if target.dir {
+    // ディレクトリの要求: 直下の index.html があれば 200、無ければ 404（403 にしない。存在偵察を防ぐ）。
+    let index = index_of(&target.rel);
+    return match fetch(&dir, &index, max_body) {
+      Fetched.Found(body) => ok_file(body, &index),
+      Fetched.TooLarge => plain(500, &"Internal Server Error\n"),
+      Fetched.Failed => plain(500, &"Internal Server Error\n"),
+      _ => plain(404, &"Not Found\n"),
+    };
+  }
+  return match fetch(&dir, &target.rel, max_body) {
+    Fetched.Found(body) => ok_file(body, &target.rel),
+    Fetched.Directory => HttpResponse.new(301, "Moved Permanently\n".as_bytes()).with_header(&"location", &raw_path.concat(&"/".as_bytes())).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()),
+    Fetched.TooLarge => plain(500, &"Internal Server Error\n"),
+    Fetched.Failed => plain(500, &"Internal Server Error\n"),
+    Fetched.Missing => plain(404, &"Not Found\n"),
+  };
+}
+
+fn route(root: &String, max_body: Int, req: &HttpRequest) -> HttpResponse
+  intent "メソッドと経路を検査し、公開ルートのファイルへ写して応答にする"
+  requires 1 <= max_body
+  ensures none
+  effects fs
+{
+  let method = req.method();
+  if method != "GET" && method != "HEAD" {
+    return plain(405, &"Method Not Allowed\n").with_header(&"allow", &"GET, HEAD".as_bytes());
+  }
+  let raw_path = req.path();
+  match decode_target(&raw_path) {
+    None => {
+      return plain(400, &"Bad Request\n");
+    }
+    Some(target) => {
+      match fs.open_dir(&Path.new(&root)) {
+        Err(_) => {
+          return plain(500, &"Internal Server Error\n");
+        }
+        Ok(dir) => {
+          let res = lookup(&dir, &target, &raw_path, max_body);
+          let _ = dir.close();
+          return res;
+        }
+      }
+    }
+  }
+}
+
+fn decimal(n: Int) -> Bytes
+  intent "0 以上の整数を 10 進のバイト列にする（負は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  if n <= 0 {
+    let mut zero = Bytes.new();
+    zero.push(48);
+    return zero;
+  }
+  let mut rev = Bytes.new();
+  let mut rest = n;
+  while rest > 0 {
+    rev.push(48 + rest % 10);
+    rest = rest / 10;
+  }
+  let mut out = Bytes.new();
+  let mut i = rev.byte_len();
+  while i > 0 {
+    i = i - 1;
+    out.push(rev.get(i).unwrap_or(48));
+  }
+  return out;
+}
+
+fn printable(b: &Bytes) -> Bytes
+  intent "ログの 1 行を壊さないよう、0x21〜0x7E 以外のバイトを `?` にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(63);
+    if c >= 33 && c <= 126 {
+      out.push(c);
+    } else {
+      out.push(63);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn version_text(v: Int) -> String
+  intent "HTTP の版の表記"
+  requires none
+  ensures none
+  effects none
+{
+  if v == 11 {
+    return "HTTP/1.1";
+  }
+  if v == 10 {
+    return "HTTP/1.0";
+  }
+  return "HTTP/?";
+}
+
+// アクセスログ 1 行: `時刻 メソッド 経路 HTTP版 状態 バイト数`（ADR 0056 仕様詳細 段階 1）。
+// 経路は届いたままの形（百分率符号つき）で、印字できないバイトは `?` にする。送信バイト数は本文のバイト数
+// （HEAD は本文を送らないので 0）。
+pub fn access_line(now: Int, req: &HttpRequest, res: &HttpResponse) -> String
+  intent "アクセスログの 1 行を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut line = Bytes.new();
+  line.extend(&decimal(now));
+  line.push(32);
+  line.extend(&printable(&req.method().as_bytes()));
+  line.push(32);
+  line.extend(&printable(&req.path()));
+  line.push(32);
+  line.extend(&version_text(req.version()).as_bytes());
+  line.push(32);
+  line.extend(&decimal(res.status()));
+  line.push(32);
+  let mut sent = res.body().byte_len();
+  if req.method() == "HEAD" {
+    sent = 0;
+  }
+  line.extend(&decimal(sent));
+  return line.to_string_utf8().unwrap_or("");
+}
+
+// 名前つきハンドラ本体（`http.serve_conn` のハンドラから呼ぶ）。応答を作ってから 1 行ログを出す。
+pub fn serve_request(root: &String, max_body: Int, req: &HttpRequest) -> HttpResponse
+  intent "要求を処理して応答を返し、アクセスログを標準出力へ 1 行出す"
+  requires 1 <= max_body
+  ensures none
+  effects clock, console, fs
+{
+  let res = route(&root, max_body, &req);
+  let now = clock.unix_seconds().unwrap_or(0);
+  console.log(&access_line(now, &req, &res));
+  return res;
+}

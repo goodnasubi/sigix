@@ -1,0 +1,183 @@
+module tests.test_target
+  targets server
+  trust none
+
+use sigix.target.decode_target;
+use tests.support.fail;
+
+fn accepts(path: &String, rel: &String, dir: Bool) -> Bool
+  intent "経路が受理され、相対パスと末尾 `/` の有無が期待どおりか"
+  requires none
+  ensures none
+  effects none
+{
+  return match decode_target(&path.as_bytes()) {
+    Some(t) => t.rel == rel && t.dir == dir,
+    None => false,
+  };
+}
+
+fn rejects(path: &String) -> Bool
+  intent "経路が拒否される（None）か"
+  requires none
+  ensures none
+  effects none
+{
+  return decode_target(&path.as_bytes()).is_none();
+}
+
+pub fn run_target_tests() -> Bool
+  intent "経路の復号と検査（第 1 防衛線）をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  if !accepts(&"/", &"", true) {
+    return fail(&"target: root");
+  }
+  if !accepts(&"/a.txt", &"a.txt", false) {
+    return fail(&"target: file");
+  }
+  if !accepts(&"/docs/", &"docs", true) {
+    return fail(&"target: trailing slash is a directory request");
+  }
+  if !accepts(&"/docs", &"docs", false) {
+    return fail(&"target: no trailing slash");
+  }
+  if !accepts(&"/a/b/c.js", &"a/b/c.js", false) {
+    return fail(&"target: nested");
+  }
+  if !accepts(&"/sp%20ace.txt", &"sp ace.txt", false) {
+    return fail(&"target: percent space");
+  }
+  if !accepts(&"/%E3%81%82.txt", &"あ.txt", false) {
+    return fail(&"target: percent utf-8");
+  }
+  if !accepts(&"/%41%62.txt", &"Ab.txt", false) {
+    return fail(&"target: percent letters");
+  }
+  if !accepts(&"/a%25b", &"a%b", false) {
+    return fail(&"target: decoded only once (%25)");
+  }
+  if !accepts(&"/%252e%252e", &"%2e%2e", false) {
+    return fail(&"target: double encoded dots are literal after one decode");
+  }
+  if !accepts(&"/...", &"...", false) {
+    return fail(&"target: three dots is a normal name");
+  }
+  if !accepts(&"/.hidden", &".hidden", false) {
+    return fail(&"target: dot file name is a normal name");
+  }
+  if !accepts(&"/a.", &"a.", false) {
+    return fail(&"target: trailing dot name");
+  }
+  // 拒否: `.` と `..`、符号化された形を含む
+  if !rejects(&"/..") {
+    return fail(&"target: ..");
+  }
+  if !rejects(&"/../etc/passwd") {
+    return fail(&"target: ../etc/passwd");
+  }
+  if !rejects(&"/a/../b") {
+    return fail(&"target: a/../b");
+  }
+  if !rejects(&"/a/..") {
+    return fail(&"target: a/..");
+  }
+  if !rejects(&"/a/../") {
+    return fail(&"target: a/../");
+  }
+  if !rejects(&"/.") {
+    return fail(&"target: .");
+  }
+  if !rejects(&"/./a") {
+    return fail(&"target: ./a");
+  }
+  if !rejects(&"/a/./b") {
+    return fail(&"target: a/./b");
+  }
+  if !rejects(&"/%2e%2e/etc/passwd") {
+    return fail(&"target: %2e%2e");
+  }
+  if !rejects(&"/%2E%2E/etc/passwd") {
+    return fail(&"target: %2E%2E");
+  }
+  if !rejects(&"/.%2e/x") {
+    return fail(&"target: .%2e");
+  }
+  if !rejects(&"/%2e/x") {
+    return fail(&"target: %2e");
+  }
+  // 符号化された区切り、逆スラッシュ、制御文字、不正な符号
+  if !rejects(&"/a%2fb") {
+    return fail(&"target: %2f");
+  }
+  if !rejects(&"/a%2Fb") {
+    return fail(&"target: %2F");
+  }
+  if !rejects(&"/a%5cb") {
+    return fail(&"target: %5c");
+  }
+  if !rejects(&"/a%5Cb") {
+    return fail(&"target: %5C");
+  }
+  if !rejects(&"/a\\b") {
+    return fail(&"target: raw backslash");
+  }
+  if !rejects(&"/a%00b") {
+    return fail(&"target: %00");
+  }
+  if !rejects(&"/a%0ab") {
+    return fail(&"target: %0a");
+  }
+  if !rejects(&"/a%0Db") {
+    return fail(&"target: %0D");
+  }
+  if !rejects(&"/a%1fb") {
+    return fail(&"target: %1f");
+  }
+  if !rejects(&"/a%7fb") {
+    return fail(&"target: %7f");
+  }
+  if !rejects(&"/a%") {
+    return fail(&"target: lone percent");
+  }
+  if !rejects(&"/a%4") {
+    return fail(&"target: half percent");
+  }
+  if !rejects(&"/a%zz") {
+    return fail(&"target: non-hex percent");
+  }
+  if !rejects(&"/%C3%28") {
+    return fail(&"target: invalid utf-8");
+  }
+  // 空区間（`//`）、`/` で始まらない対象
+  if !rejects(&"//") {
+    return fail(&"target: //");
+  }
+  if !rejects(&"//a") {
+    return fail(&"target: //a");
+  }
+  if !rejects(&"/a//b") {
+    return fail(&"target: a//b");
+  }
+  if !rejects(&"/a//") {
+    return fail(&"target: a//");
+  }
+  if !rejects(&"/a///") {
+    return fail(&"target: a///");
+  }
+  if !rejects(&"") {
+    return fail(&"target: empty");
+  }
+  if !rejects(&"*") {
+    return fail(&"target: asterisk form");
+  }
+  if !rejects(&"a/b") {
+    return fail(&"target: relative");
+  }
+  if !rejects(&"http://evil.example/x") {
+    return fail(&"target: absolute form");
+  }
+  return true;
+}

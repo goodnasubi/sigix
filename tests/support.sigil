@@ -1,0 +1,69 @@
+module tests.support
+  targets server
+  trust none
+
+// テスト共通の補助。要求は `std.http` の解釈器に通して作る（実際の接続と同じ解釈）。
+
+pub fn make_request(method: &String, target: &String) -> Option<HttpRequest>
+  intent "メソッドと対象から HTTP/1.1 の要求を解釈して作る。解釈に失敗したら None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut wire = Bytes.new();
+  wire.extend(&method.as_bytes());
+  wire.push(32);
+  wire.extend(&target.as_bytes());
+  wire.extend(&" HTTP/1.1\r\nHost: sigix.test\r\n\r\n".as_bytes());
+  let limits = http.default_limits();
+  let mut parser = http.parser(&limits);
+  return match parser.feed(&wire, 0) {
+    Ok(progress) => match progress {
+      HttpProgress.Done(req, _) => Some(req),
+      HttpProgress.NeedMore => None,
+    },
+    Err(_) => None,
+  };
+}
+
+pub fn header_of(res: &HttpResponse, name: &String) -> String
+  intent "応答の見出しの値（無ければ空文字列）。名前は小文字で比べる"
+  requires none
+  ensures none
+  effects none
+{
+  let hs = res.headers();
+  let mut i = 0;
+  while i < hs.len() {
+    match hs.get(i) {
+      Some(h) => {
+        if h.name() == name {
+          return h.value().to_string_utf8().unwrap_or("");
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+pub fn body_text(res: &HttpResponse) -> String
+  intent "応答本文を文字列にする（UTF-8 でなければ空文字列）"
+  requires none
+  ensures none
+  effects none
+{
+  return res.body().to_string_utf8().unwrap_or("");
+}
+
+pub fn fail(name: &String) -> Bool
+  intent "失敗したテストの名前を標準出力へ出して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&"FAIL");
+  console.log(&name);
+  return false;
+}

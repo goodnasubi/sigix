@@ -1,0 +1,153 @@
+module sigix.target
+  targets server
+  trust none
+
+// 要求の経路（百分率符号つきのバイト列）を、公開ルートからの相対パスへ写す第 1 防衛線（ADR 0056 脅威と対策 1）。
+// ここを通っても、ファイルの取得は必ず `Dir` 起点（ADR 0049）で行う。最終防衛はそちらにある。
+
+// 検証済みの対象。
+// - rel: 公開ルートからの相対パス（復号後、先頭と末尾の `/` なし）。ルートそのものは空文字列。
+// - dir: 要求が末尾 `/` で終わる（ルート `/` を含む）。ディレクトリの要求として扱う。
+pub struct Target {
+  rel: String,
+  dir: Bool,
+}
+
+fn hex_value(c: Int) -> Int
+  intent "16 進数字 1 文字の値を返す。16 進数字でなければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return c - 48;
+  }
+  if c >= 65 && c <= 70 {
+    return c - 55;
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87;
+  }
+  return 0 - 1;
+}
+
+// 復号後の 1 バイトを受け付けるか。逆スラッシュ・制御文字（0x00〜0x1F、0x7F）は拒否する。
+fn allowed_byte(c: Int) -> Bool
+  intent "復号後のバイトが逆スラッシュでも制御文字でもないか"
+  requires none
+  ensures none
+  effects none
+{
+  if c < 32 || c == 127 || c == 92 {
+    return false;
+  }
+  return true;
+}
+
+// 百分率符号を 1 度だけ復号する。`/` は生の `/` だけを区切りとして通し、符号化された `/`（%2F）は拒否する。
+// 不正な符号（`%` の後が 16 進 2 桁でない）も拒否する。
+fn percent_decode(enc: &Bytes) -> Option<Bytes>
+  intent "百分率符号を 1 度だけ復号する。符号化された区切り・逆スラッシュ・制御文字・不正な符号は None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let n = enc.byte_len();
+  let mut i = 0;
+  while i < n {
+    let c = enc.get(i).unwrap_or(0);
+    if c == 37 {
+      if i + 2 >= n {
+        return None;
+      }
+      let hi = hex_value(enc.get(i + 1).unwrap_or(0));
+      let lo = hex_value(enc.get(i + 2).unwrap_or(0));
+      if hi < 0 || lo < 0 {
+        return None;
+      }
+      let d = hi * 16 + lo;
+      if d == 47 || !allowed_byte(d) {
+        return None;
+      }
+      out.push(d);
+      i = i + 3;
+    } else {
+      if c != 47 && !allowed_byte(c) {
+        return None;
+      }
+      out.push(c);
+      i = i + 1;
+    }
+  }
+  return Some(out);
+}
+
+// 構成要素（`/` で区切った 1 区間）の検査。空区間（`//`）と `.`・`..` は拒否する。
+fn segments_ok(b: &Bytes) -> Bool
+  intent "先頭の `/` と末尾の `/` を除いた相対パスが、空・`.`・`..` の構成要素を持たないか"
+  requires none
+  ensures none
+  effects none
+{
+  let n = b.byte_len();
+  let mut start = 0;
+  let mut i = 0;
+  while i <= n {
+    let mut c = 47;
+    if i < n {
+      c = b.get(i).unwrap_or(0);
+    }
+    if c == 47 {
+      let len = i - start;
+      if len == 0 {
+        return false;
+      }
+      if len == 1 && b.get(start).unwrap_or(0) == 46 {
+        return false;
+      }
+      if len == 2 && b.get(start).unwrap_or(0) == 46 && b.get(start + 1).unwrap_or(0) == 46 {
+        return false;
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn decode_target(enc: &Bytes) -> Option<Target>
+  intent "経路を復号して検査し、公開ルートからの相対パスにする。拒否する形は None（呼び出し側が 400 にする）"
+  requires none
+  ensures none
+  effects none
+{
+  if enc.byte_len() == 0 || enc.get(0).unwrap_or(0) != 47 {
+    return None;
+  }
+  match percent_decode(&enc) {
+    None => {
+      return None;
+    }
+    Some(decoded) => {
+      let n = decoded.byte_len();
+      if n == 1 {
+        return Some(Target { rel: "", dir: true });
+      }
+      let mut end = n;
+      let mut dir = false;
+      if decoded.get(n - 1).unwrap_or(0) == 47 {
+        end = n - 1;
+        dir = true;
+      }
+      let body = decoded.slice(1, end).unwrap_or(Bytes.new());
+      if !segments_ok(&body) {
+        return None;
+      }
+      return match body.to_string_utf8() {
+        Ok(s) => Some(Target { rel: s, dir: dir }),
+        Err(_) => None,
+      };
+    }
+  }
+}

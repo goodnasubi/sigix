@@ -1,0 +1,116 @@
+module sigix.mime
+  targets server
+  trust none
+
+fn lower_ascii(b: &Bytes) -> Bytes
+  intent "ASCII の大文字だけを小文字にしたバイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c >= 65 && c <= 90 {
+      out.push(c + 32);
+    } else {
+      out.push(c);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn extension_of(name: &String) -> String
+  intent "最後の構成要素の拡張子（最後の `.` より後、小文字）を返す。`.` が無い、先頭だけ、末尾なら空文字列"
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  let mut dot = -1;
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 47 {
+      dot = -1;
+    }
+    if c == 46 {
+      dot = i;
+    }
+    i = i + 1;
+  }
+  if dot <= 0 {
+    return "";
+  }
+  if b.get(dot - 1).unwrap_or(0) == 47 {
+    return "";
+  }
+  let tail = b.slice(dot + 1, b.byte_len()).unwrap_or(Bytes.new());
+  return lower_ascii(&tail).to_string_utf8().unwrap_or("");
+}
+
+pub fn mime_type(name: &String) -> String
+  intent "ファイル名の拡張子から Content-Type を決める。未知の拡張子と拡張子の無いファイルは application/octet-stream"
+  requires none
+  ensures none
+  effects none
+{
+  let ext = extension_of(&name);
+  if ext == "html" || ext == "htm" {
+    return "text/html; charset=utf-8";
+  }
+  if ext == "css" {
+    return "text/css; charset=utf-8";
+  }
+  if ext == "js" || ext == "mjs" {
+    return "text/javascript; charset=utf-8";
+  }
+  if ext == "json" || ext == "map" {
+    return "application/json";
+  }
+  if ext == "txt" {
+    return "text/plain; charset=utf-8";
+  }
+  if ext == "csv" {
+    return "text/csv; charset=utf-8";
+  }
+  if ext == "md" {
+    return "text/markdown; charset=utf-8";
+  }
+  if ext == "xml" {
+    return "application/xml";
+  }
+  if ext == "svg" {
+    return "image/svg+xml";
+  }
+  if ext == "png" {
+    return "image/png";
+  }
+  if ext == "jpg" || ext == "jpeg" {
+    return "image/jpeg";
+  }
+  if ext == "gif" {
+    return "image/gif";
+  }
+  if ext == "webp" {
+    return "image/webp";
+  }
+  if ext == "ico" {
+    return "image/x-icon";
+  }
+  if ext == "wasm" {
+    return "application/wasm";
+  }
+  if ext == "pdf" {
+    return "application/pdf";
+  }
+  if ext == "woff" {
+    return "font/woff";
+  }
+  if ext == "woff2" {
+    return "font/woff2";
+  }
+  return "application/octet-stream";
+}

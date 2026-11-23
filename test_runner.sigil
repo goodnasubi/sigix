@@ -1,0 +1,33 @@
+module test_runner
+  targets server
+  trust none
+
+use tests.test_config.run_config_tests;
+use tests.test_mime.run_mime_tests;
+use tests.test_serve.run_log_tests;
+use tests.test_serve.run_serve_tests;
+use tests.test_target.run_target_tests;
+
+pub fn main() -> Int
+  intent "すべての単体テストを実行し、全合格なら 0、不合格があれば失敗した群の番号を返す"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  if !run_target_tests() {
+    return 1;
+  }
+  if !run_mime_tests() {
+    return 2;
+  }
+  if !run_config_tests() {
+    return 3;
+  }
+  if !run_serve_tests() {
+    return 4;
+  }
+  if !run_log_tests() {
+    return 5;
+  }
+  return 0;
+}

@@ -1,0 +1,192 @@
+module tests.test_config
+  targets server
+  trust none
+
+use sigix.config.Config;
+use sigix.config.parse_listen;
+use sigix.config.parse_uint;
+use sigix.config.resolve;
+use tests.support.fail;
+
+fn args1(a: &String) -> List<String>
+  intent "引数 1 つの一覧"
+  requires none
+  ensures none
+  effects none
+{
+  let mut v = List.new();
+  v.push(a.clone());
+  return v;
+}
+
+fn args2(a: &String, b: &String) -> List<String>
+  intent "引数 2 つの一覧"
+  requires none
+  ensures none
+  effects none
+{
+  let mut v = args1(&a);
+  v.push(b.clone());
+  return v;
+}
+
+fn args4(a: &String, b: &String, c: &String, d: &String) -> List<String>
+  intent "引数 4 つの一覧"
+  requires none
+  ensures none
+  effects none
+{
+  let mut v = args2(&a, &b);
+  v.push(c.clone());
+  v.push(d.clone());
+  return v;
+}
+
+fn no_args() -> List<String>
+  intent "空の引数一覧"
+  requires none
+  ensures none
+  effects none
+{
+  return List.new();
+}
+
+fn none_s() -> Option<String>
+  intent "未設定の環境変数"
+  requires none
+  ensures none
+  effects none
+{
+  return None;
+}
+
+fn some_s(s: &String) -> Option<String>
+  intent "設定済みの環境変数"
+  requires none
+  ensures none
+  effects none
+{
+  return Some(s.clone());
+}
+
+fn same(c: &Result<Config, String>, host: &String, port: Int, root: &String, max_body: Int) -> Bool
+  intent "設定が期待どおりか"
+  requires none
+  ensures none
+  effects none
+{
+  return match c {
+    Ok(cfg) => cfg.host == host && cfg.port == port && cfg.root == root && cfg.max_body == max_body,
+    Err(_) => false,
+  };
+}
+
+pub fn run_config_tests() -> Bool
+  intent "設定の読み取りと fail-closed をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  // 数字だけの値
+  if parse_uint(&"0", 5) != Some(0) || parse_uint(&"65535", 5) != Some(65535) {
+    return fail(&"config: parse_uint ok");
+  }
+  if parse_uint(&"", 5).is_some() || parse_uint(&"+1", 5).is_some() || parse_uint(&"-1", 5).is_some() || parse_uint(&" 1", 5).is_some() || parse_uint(&"1 ", 5).is_some() || parse_uint(&"1a", 5).is_some() || parse_uint(&"123456", 5).is_some() {
+    return fail(&"config: parse_uint bad");
+  }
+  // 待ち受け
+  if parse_listen(&"127.0.0.1:8080").is_none() || parse_listen(&"[::1]:8080").is_none() || parse_listen(&"0.0.0.0:1").is_none() || parse_listen(&"127.0.0.1:65535").is_none() {
+    return fail(&"config: listen ok");
+  }
+  if parse_listen(&"127.0.0.1").is_some() || parse_listen(&":8080").is_some() || parse_listen(&"127.0.0.1:").is_some() || parse_listen(&"127.0.0.1:0").is_some() || parse_listen(&"127.0.0.1:65536").is_some() || parse_listen(&"127.0.0.1:08080x").is_some() || parse_listen(&"::1:8080").is_some() || parse_listen(&"[::1]").is_some() || parse_listen(&"[]:80").is_some() || parse_listen(&"[::1]8080").is_some() || parse_listen(&"localhost:8080").is_some() || parse_listen(&"1.2.3.4:80:90").is_some() {
+    return fail(&"config: listen bad");
+  }
+  // 既定値と環境変数
+  let d = resolve(&no_args(), none_s(), some_s(&"/srv"), none_s());
+  if !same(&d, &"127.0.0.1", 8080, &"/srv", 1048576) {
+    return fail(&"config: defaults");
+  }
+  let e = resolve(&no_args(), some_s(&"[::1]:9000"), some_s(&"/srv"), some_s(&"2048"));
+  if !same(&e, &"::1", 9000, &"/srv", 2048) {
+    return fail(&"config: env");
+  }
+  // 起動引数は環境変数に勝つ。`--name value` と `--name=value` の両方。
+  let c1 = resolve(&args4(&"--listen", &"127.0.0.1:9100", &"--root", &"/www"), some_s(&"127.0.0.1:9000"), some_s(&"/srv"), none_s());
+  if !same(&c1, &"127.0.0.1", 9100, &"/www", 1048576) {
+    return fail(&"config: args beat env");
+  }
+  let c2 = resolve(&args2(&"--root=/www", &"--max-response-body=67108864"), none_s(), none_s(), none_s());
+  if !same(&c2, &"127.0.0.1", 8080, &"/www", 67108864) {
+    return fail(&"config: inline values and 64 MiB");
+  }
+  let c3 = resolve(&args1(&"--root=/a=b"), none_s(), none_s(), none_s());
+  if !same(&c3, &"127.0.0.1", 8080, &"/a=b", 1048576) {
+    return fail(&"config: value may contain =");
+  }
+  let c4 = resolve(&args2(&"--max-response-body=1", &"--root=/r"), none_s(), none_s(), none_s());
+  if !same(&c4, &"127.0.0.1", 8080, &"/r", 1) {
+    return fail(&"config: minimum body limit");
+  }
+  // 不正・範囲外は Err（起動時に即座に拒否）
+  if resolve(&no_args(), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: root is required");
+  }
+  if resolve(&no_args(), none_s(), some_s(&""), none_s()).is_ok() {
+    return fail(&"config: empty root env");
+  }
+  if resolve(&args1(&"--root="), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: empty root arg");
+  }
+  if resolve(&no_args(), some_s(&"bad"), some_s(&"/r"), none_s()).is_ok() {
+    return fail(&"config: bad listen env");
+  }
+  if resolve(&args2(&"--listen", &"127.0.0.1:0"), none_s(), some_s(&"/r"), none_s()).is_ok() {
+    return fail(&"config: port 0");
+  }
+  if resolve(&args1(&"--root=/r"), some_s(&""), none_s(), none_s()).is_ok() {
+    return fail(&"config: empty listen env");
+  }
+  if resolve(&args2(&"--root=/r", &"--max-response-body=0"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: body limit 0");
+  }
+  if resolve(&args2(&"--root=/r", &"--max-response-body=67108865"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: body limit above 64 MiB");
+  }
+  if resolve(&args2(&"--root=/r", &"--max-response-body=-1"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: negative body limit");
+  }
+  if resolve(&args2(&"--root=/r", &"--max-response-body=abc"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: non numeric body limit");
+  }
+  if resolve(&args2(&"--root=/r", &"--max-response-body="), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: empty body limit arg");
+  }
+  if resolve(&args1(&"--root=/r"), none_s(), none_s(), some_s(&"")).is_ok() {
+    return fail(&"config: empty body limit env");
+  }
+  if resolve(&args1(&"--root=/r"), none_s(), none_s(), some_s(&"9999999999")).is_ok() {
+    return fail(&"config: huge body limit env");
+  }
+  if resolve(&args2(&"--root=/r", &"--bogus=1"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: unknown option");
+  }
+  if resolve(&args2(&"--root=/r", &"extra"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: positional argument");
+  }
+  if resolve(&args2(&"--root=/r", &"--listen"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: missing value");
+  }
+  if resolve(&args2(&"--root=/r", &"--root=/s"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: duplicate root");
+  }
+  if resolve(&args4(&"--listen=127.0.0.1:1", &"--listen=127.0.0.1:2", &"--root=/r", &"--root=/r"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: duplicate listen");
+  }
+  if resolve(&args2(&"--root=/r", &"-x"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: single dash");
+  }
+  if resolve(&args2(&"--root=/r", &"--"), none_s(), none_s(), none_s()).is_ok() {
+    return fail(&"config: double dash only");
+  }
+  return true;
+}
