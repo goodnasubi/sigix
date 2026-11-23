@@ -1,0 +1,83 @@
+module main
+  targets server
+  trust none
+
+use sigix.config.Config;
+use sigix.config.load_config;
+use sigix.serve.serve_request;
+
+// 接続ごとの上限。応答本文の上限だけを設定で変え、ほかは既定（ADR 0020 決定 4）のまま使う。
+fn limits_for(max_body: Int) -> HttpLimits
+  intent "HttpLimits の既定に、設定された応答本文の上限だけを反映する"
+  requires 1 <= max_body && max_body <= 67108864
+  ensures none
+  effects none
+{
+  return http.default_limits().with_response_body(max_body);
+}
+
+fn serve(cfg: &Config) -> Int
+  intent "公開ルートを確認し、待ち受けて、接続ごとに別のルートで静的ファイルを配信する（終了しない）"
+  requires 1 <= cfg.max_body && cfg.max_body <= 67108864
+  ensures none
+  effects clock, console, fs, net.server, task
+{
+  // 起動時の確認: 公開ルートを開けなければ待ち受けない（fail-closed）。
+  match fs.open_dir(&Path.new(&cfg.root)) {
+    Err(_) => {
+      console.log(&"sigix: 公開ルートを開けません（--root / SIGIX_ROOT）");
+      return 2;
+    }
+    Ok(d) => {
+      let _ = d.close();
+    }
+  }
+  let limits = limits_for(cfg.max_body);
+  match net.listen(&cfg.host, cfg.port, limits.backlog()) {
+    Err(_) => {
+      console.log(&"sigix: 待ち受けできません（--listen / SIGIX_LISTEN）");
+      return 3;
+    }
+    Ok(listener) => {
+      let root = cfg.root.clone();
+      let max_body = cfg.max_body;
+      return task.roots(limits.conns(), |g| {
+        while true {
+          let slot = g.reserve();
+          match listener.accept() {
+            Ok(stream) => {
+              let conn = http.conn(stream);
+              let root_c = root.clone();
+              slot.start(conn, move |c| {
+                http.serve_conn(&c, &limits_for(max_body), |req| serve_request(&root_c, max_body, &req));
+              }, move |c| {
+                http.abort_conn(c, &limits_for(max_body));
+              });
+            }
+            Err(_) => {}
+          }
+        }
+        return 0;
+      });
+    }
+  }
+}
+
+// 起動引数: `[--listen,127.0.0.1:8080,--root,/srv/www]`（`sigil run` と実行ファイルの引数は 1 つの一覧で渡す）。
+// 数字だけの値は文字列として渡らないので、`--max-response-body=67108864` の形で書く。
+pub fn main(args: List<String>) -> Int
+  intent "設定を読み（不正なら終了コード 2 で即座に終わる）、静的ファイル配信サーバーを起動する"
+  requires none
+  ensures none
+  effects clock, console, env, fs, net.server, task
+{
+  match load_config(&args) {
+    Err(msg) => {
+      console.log(&msg);
+      return 2;
+    }
+    Ok(cfg) => {
+      return serve(&cfg);
+    }
+  }
+}

@@ -1,0 +1,73 @@
+module tests.test_mime
+  targets server
+  trust none
+
+use sigix.mime.extension_of;
+use sigix.mime.mime_type;
+use tests.support.fail;
+
+pub fn run_mime_tests() -> Bool
+  intent "拡張子による MIME 判定をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  if mime_type(&"index.html") != "text/html; charset=utf-8" {
+    return fail(&"mime: html");
+  }
+  if mime_type(&"a/b/page.HTM") != "text/html; charset=utf-8" {
+    return fail(&"mime: htm upper");
+  }
+  if mime_type(&"s.css") != "text/css; charset=utf-8" {
+    return fail(&"mime: css");
+  }
+  if mime_type(&"STYLE.CSS") != "text/css; charset=utf-8" {
+    return fail(&"mime: css upper");
+  }
+  if mime_type(&"a.js") != "text/javascript; charset=utf-8" {
+    return fail(&"mime: js");
+  }
+  if mime_type(&"a.json") != "application/json" {
+    return fail(&"mime: json");
+  }
+  if mime_type(&"a.txt") != "text/plain; charset=utf-8" {
+    return fail(&"mime: txt");
+  }
+  if mime_type(&"a.svg") != "image/svg+xml" {
+    return fail(&"mime: svg");
+  }
+  if mime_type(&"a.png") != "image/png" {
+    return fail(&"mime: png");
+  }
+  if mime_type(&"a.jpg") != "image/jpeg" {
+    return fail(&"mime: jpg");
+  }
+  if mime_type(&"a.jpeg") != "image/jpeg" {
+    return fail(&"mime: jpeg");
+  }
+  if mime_type(&"a.wasm") != "application/wasm" {
+    return fail(&"mime: wasm");
+  }
+  if mime_type(&"a.tar.gz") != "application/octet-stream" {
+    return fail(&"mime: unknown last extension");
+  }
+  if mime_type(&"data.xyz") != "application/octet-stream" {
+    return fail(&"mime: unknown");
+  }
+  if mime_type(&"noext") != "application/octet-stream" {
+    return fail(&"mime: no extension");
+  }
+  if mime_type(&".html") != "application/octet-stream" {
+    return fail(&"mime: dot file only");
+  }
+  if mime_type(&"dir.html/noext") != "application/octet-stream" {
+    return fail(&"mime: extension belongs to the last component");
+  }
+  if mime_type(&"a.") != "application/octet-stream" {
+    return fail(&"mime: trailing dot");
+  }
+  if extension_of(&"A.B.TXT") != "txt" {
+    return fail(&"mime: extension_of");
+  }
+  return true;
+}

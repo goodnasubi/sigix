@@ -1,0 +1,279 @@
+module tests.test_serve
+  targets server
+  trust none
+
+use sigix.serve.access_line;
+use sigix.serve.serve_request;
+use tests.support.body_text;
+use tests.support.fail;
+use tests.support.header_of;
+use tests.support.make_request;
+
+fn root() -> String
+  intent "テスト用の公開ルート（リポジトリの直下から見た相対パス）"
+  requires none
+  ensures none
+  effects none
+{
+  return "tests/fixtures/www";
+}
+
+// 要求を作って処理し、応答を返す。要求を解釈できなければ 599 の応答を返して失敗を知らせる。
+fn call(method: &String, target: &String, max_body: Int) -> HttpResponse
+  intent "要求を解釈し、公開ルートに対して処理する"
+  requires 1 <= max_body
+  ensures none
+  effects clock, console, fs
+{
+  return match make_request(&method, &target) {
+    Some(req) => serve_request(&root(), max_body, &req),
+    None => HttpResponse.new(599, Bytes.new()),
+  };
+}
+
+fn get(target: &String) -> HttpResponse
+  intent "既定の上限（1 MiB）で GET する"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  return call(&"GET", &target, 1048576);
+}
+
+pub fn run_serve_tests() -> Bool
+  intent "静的ファイル配信の要求処理をテストする（受け入れ条件 1〜4）"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  // 1. 既存ファイルは 200・本文・Content-Type
+  let a = get(&"/a.txt");
+  if a.status() != 200 || body_text(&a) != "hello\n" || header_of(&a, &"content-type") != "text/plain; charset=utf-8" {
+    return fail(&"serve: GET /a.txt");
+  }
+  let idx = get(&"/index.html");
+  if idx.status() != 200 || header_of(&idx, &"content-type") != "text/html; charset=utf-8" {
+    return fail(&"serve: GET /index.html");
+  }
+  let css = get(&"/STYLE.CSS");
+  if css.status() != 200 || header_of(&css, &"content-type") != "text/css; charset=utf-8" {
+    return fail(&"serve: upper case extension");
+  }
+  let js = get(&"/nested/deep/file.json");
+  if js.status() != 200 || header_of(&js, &"content-type") != "application/json" || body_text(&js) != "{\"deep\":true}\n" {
+    return fail(&"serve: nested file");
+  }
+  let unk = get(&"/data.xyz");
+  if unk.status() != 200 || header_of(&unk, &"content-type") != "application/octet-stream" {
+    return fail(&"serve: unknown extension");
+  }
+  let noext = get(&"/noext");
+  if noext.status() != 200 || header_of(&noext, &"content-type") != "application/octet-stream" {
+    return fail(&"serve: no extension");
+  }
+  let sp = get(&"/sp%20ace.txt");
+  if sp.status() != 200 || body_text(&sp) != "space\n" {
+    return fail(&"serve: percent encoded name");
+  }
+  let ka = get(&"/%E3%81%82.txt");
+  if ka.status() != 200 || body_text(&ka) != "kana\n" {
+    return fail(&"serve: percent encoded utf-8 name");
+  }
+  let q = get(&"/a.txt?x=1");
+  if q.status() != 200 || body_text(&q) != "hello\n" {
+    return fail(&"serve: query string is ignored");
+  }
+  // HEAD は GET と同じ状態・見出し（本文の取り除きは std.http の責務。e2e で確かめる）
+  let h = call(&"HEAD", &"/a.txt", 1048576);
+  if h.status() != 200 || header_of(&h, &"content-type") != header_of(&a, &"content-type") {
+    return fail(&"serve: HEAD headers match GET");
+  }
+  let hm = call(&"HEAD", &"/nope", 1048576);
+  if hm.status() != 404 {
+    return fail(&"serve: HEAD missing");
+  }
+  // GET・HEAD 以外は 405（Allow: GET, HEAD）
+  let post = call(&"POST", &"/a.txt", 1048576);
+  if post.status() != 405 || header_of(&post, &"allow") != "GET, HEAD" {
+    return fail(&"serve: POST is 405");
+  }
+  let put = call(&"PUT", &"/a.txt", 1048576);
+  if put.status() != 405 {
+    return fail(&"serve: PUT is 405");
+  }
+  let del = call(&"DELETE", &"/nope", 1048576);
+  if del.status() != 405 {
+    return fail(&"serve: DELETE is 405 even for a missing path");
+  }
+  let opt = call(&"OPTIONS", &"/", 1048576);
+  if opt.status() != 405 {
+    return fail(&"serve: OPTIONS is 405");
+  }
+  let lower = call(&"get", &"/a.txt", 1048576);
+  if lower.status() != 405 {
+    return fail(&"serve: method is case sensitive");
+  }
+  // 2. 404、ディレクトリ
+  let miss = get(&"/missing.txt");
+  if miss.status() != 404 || body_text(&miss) != "Not Found\n" {
+    return fail(&"serve: 404");
+  }
+  let root_idx = get(&"/");
+  if root_idx.status() != 200 || header_of(&root_idx, &"content-type") != "text/html; charset=utf-8" || body_text(&root_idx) != body_text(&idx) {
+    return fail(&"serve: / serves index.html");
+  }
+  let docs = get(&"/docs/");
+  if docs.status() != 200 || body_text(&docs) != "docs index\n" || header_of(&docs, &"content-type") != "text/html; charset=utf-8" {
+    return fail(&"serve: /docs/ serves index.html");
+  }
+  let empty = get(&"/empty/");
+  if empty.status() != 404 {
+    return fail(&"serve: directory without index.html is 404, not 403");
+  }
+  let deep = get(&"/nested/deep/");
+  if deep.status() != 404 {
+    return fail(&"serve: nested directory without index.html is 404");
+  }
+  let idxdir = get(&"/idxdir/");
+  if idxdir.status() != 404 {
+    return fail(&"serve: index.html that is a directory is 404");
+  }
+  let nodir = get(&"/missing/");
+  if nodir.status() != 404 {
+    return fail(&"serve: missing directory is 404");
+  }
+  let moved = get(&"/docs");
+  if moved.status() != 301 || header_of(&moved, &"location") != "/docs/" {
+    return fail(&"serve: /docs redirects to /docs/");
+  }
+  let moved2 = get(&"/nested/deep");
+  if moved2.status() != 301 || header_of(&moved2, &"location") != "/nested/deep/" {
+    return fail(&"serve: nested directory redirects");
+  }
+  let moved3 = get(&"/empty");
+  if moved3.status() != 301 || header_of(&moved3, &"location") != "/empty/" {
+    return fail(&"serve: directory without index.html still redirects (ADR 0056 decision 3)");
+  }
+  let moved4 = get(&"/docs?x=1");
+  if moved4.status() != 301 || header_of(&moved4, &"location") != "/docs/" {
+    return fail(&"serve: redirect drops the query");
+  }
+  let slash_file = get(&"/a.txt/");
+  if slash_file.status() != 404 {
+    return fail(&"serve: trailing slash on a file is 404");
+  }
+  let slash_missing = get(&"/nope.txt/");
+  if slash_missing.status() != 404 {
+    return fail(&"serve: trailing slash on a missing path is 404");
+  }
+  // 3. 公開ルートからの脱出は遮断される（400 または 404。ルート外の本文は返らない）
+  let esc = get(&"/../outside.txt");
+  if esc.status() != 400 || body_text(&esc) == "OUTSIDE-SECRET\n" {
+    return fail(&"serve: dot dot");
+  }
+  let esc2 = get(&"/%2e%2e/outside.txt");
+  if esc2.status() != 400 {
+    return fail(&"serve: encoded dot dot");
+  }
+  let esc3 = get(&"/docs/..%2foutside.txt");
+  if esc3.status() != 400 {
+    return fail(&"serve: encoded separator");
+  }
+  let esc4 = get(&"/docs/..%5coutside.txt");
+  if esc4.status() != 400 {
+    return fail(&"serve: encoded backslash");
+  }
+  let esc5 = get(&"/docs/..\\outside.txt");
+  if esc5.status() != 400 {
+    return fail(&"serve: backslash");
+  }
+  let esc6 = get(&"/a%00.txt");
+  if esc6.status() != 400 {
+    return fail(&"serve: encoded NUL");
+  }
+  let esc7 = get(&"//outside.txt");
+  if esc7.status() != 400 {
+    return fail(&"serve: double slash");
+  }
+  let esc8 = get(&"/docs/./../outside.txt");
+  if esc8.status() != 400 {
+    return fail(&"serve: dot segments");
+  }
+  let sym = get(&"/link_out");
+  if sym.status() != 404 || body_text(&sym) == "OUTSIDE-SECRET\n" {
+    return fail(&"serve: symlink to a file outside the root");
+  }
+  let sym2 = get(&"/link_dir/secret.txt");
+  if sym2.status() != 404 || body_text(&sym2) == "OUTSIDE-DIR-SECRET\n" {
+    return fail(&"serve: symlink to a directory outside the root");
+  }
+  let sym3 = get(&"/link_dir/");
+  if sym3.status() != 404 {
+    return fail(&"serve: symlinked directory index");
+  }
+  let sym4 = get(&"/link_in");
+  if sym4.status() != 404 {
+    return fail(&"serve: symlinks are never followed, even inside the root");
+  }
+  // 4. 応答本文の上限（ちょうどの大きさは通り、1 バイト超えると 500 の定型本文）
+  let at = call(&"GET", &"/hundred.txt", 100);
+  if at.status() != 200 || at.body().byte_len() != 100 {
+    return fail(&"serve: file of exactly the limit is served");
+  }
+  let over = call(&"GET", &"/hundred.txt", 99);
+  if over.status() != 500 || body_text(&over) != "Internal Server Error\n" {
+    return fail(&"serve: file above the limit is 500");
+  }
+  let over_dir = call(&"GET", &"/docs/", 5);
+  if over_dir.status() != 500 {
+    return fail(&"serve: index.html above the limit is 500");
+  }
+  let tiny = call(&"GET", &"/a.txt", 1);
+  if tiny.status() != 500 {
+    return fail(&"serve: limit of 1 byte");
+  }
+  return true;
+}
+
+pub fn run_log_tests() -> Bool
+  intent "アクセスログの形式をテストする（受け入れ条件 6）"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  match make_request(&"GET", &"/a.txt") {
+    None => {
+      return fail(&"log: request");
+    }
+    Some(req) => {
+      let res = serve_request(&root(), 1048576, &req);
+      if access_line(1763784000, &req, &res) != "1763784000 GET /a.txt HTTP/1.1 200 6" {
+        return fail(&"log: GET line");
+      }
+    }
+  }
+  match make_request(&"HEAD", &"/a.txt?x=1") {
+    None => {
+      return fail(&"log: head request");
+    }
+    Some(req) => {
+      let res = serve_request(&root(), 1048576, &req);
+      // 送信バイト数は本文のバイト数（HEAD は 0）。経路は `?` の前だけ。
+      if access_line(5, &req, &res) != "5 HEAD /a.txt HTTP/1.1 200 0" {
+        return fail(&"log: HEAD line");
+      }
+    }
+  }
+  match make_request(&"GET", &"/a%0Ab") {
+    None => {
+      return fail(&"log: encoded request");
+    }
+    Some(req) => {
+      let res = serve_request(&root(), 1048576, &req);
+      if access_line(0, &req, &res) != "0 GET /a%0Ab HTTP/1.1 400 12" {
+        return fail(&"log: 400 line keeps the request path as received");
+      }
+    }
+  }
+  return true;
+}

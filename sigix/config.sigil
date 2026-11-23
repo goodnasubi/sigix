@@ -1,0 +1,329 @@
+module sigix.config
+  targets server
+  trust none
+
+// 段階 1 の設定（ADR 0056 決定 2）。起動引数（CLI オプション）と環境変数で指定し、再読み込みはプロセスの再起動だけ。
+// 不正・範囲外の値は起動時にすべて拒否する（fail-closed）。優先順位は、起動引数 > 環境変数 > 既定値。
+//
+//   --listen ADDR:PORT        環境変数 SIGIX_LISTEN             既定 127.0.0.1:8080（IPv6 は [::1]:8080）
+//   --root DIR                環境変数 SIGIX_ROOT               必須（既定なし）
+//   --max-response-body BYTES 環境変数 SIGIX_MAX_RESPONSE_BODY  既定 1048576、範囲 1〜67108864
+//
+// 値は `--name value` と `--name=value` のどちらでも渡せる。
+
+pub struct Config {
+  host: String,
+  port: Int,
+  root: String,
+  max_body: Int,
+}
+
+fn is_digit(c: Int) -> Bool
+  intent "ASCII の 10 進数字か"
+  requires none
+  ensures none
+  effects none
+{
+  return c >= 48 && c <= 57;
+}
+
+// 数字だけからなる 1〜max_digits 桁の非負整数。符号・空白・空文字列は None。
+pub fn parse_uint(s: &String, max_digits: Int) -> Option<Int>
+  intent "10 進数字だけの文字列を整数にする。空・桁あふれ・数字以外は None"
+  requires 1 <= max_digits && max_digits <= 18
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  if b.byte_len() == 0 || b.byte_len() > max_digits {
+    return None;
+  }
+  let mut acc = 0;
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if !is_digit(c) {
+      return None;
+    }
+    acc = acc * 10 + (c - 48);
+    i = i + 1;
+  }
+  return Some(acc);
+}
+
+fn host_char_ok(c: Int) -> Bool
+  intent "数値アドレス（IPv4・IPv6）に使える文字か"
+  requires none
+  ensures none
+  effects none
+{
+  if is_digit(c) || c == 46 || c == 58 {
+    return true;
+  }
+  return (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+fn host_ok(h: &String) -> Bool
+  intent "待ち受けアドレスが空でなく、数値アドレスに使える文字だけか（名前解決はしない。ADR 0031 決定 3）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = h.as_bytes();
+  if b.byte_len() == 0 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.byte_len() {
+    if !host_char_ok(b.get(i).unwrap_or(0)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// `ADDR:PORT` または `[IPv6]:PORT`。ポートは 1〜65535。
+pub fn parse_listen(s: &String) -> Option<Config>
+  intent "待ち受け指定を（アドレス、ポート）にする。形式不正・範囲外は None。戻り値の Config は host と port だけが意味を持つ"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let n = b.byte_len();
+  let mut host_bytes = Bytes.new();
+  let mut port_start = 0;
+  if n > 0 && b.get(0).unwrap_or(0) == 91 {
+    // [IPv6]:PORT
+    let mut close = 0 - 1;
+    let mut i = 1;
+    while i < n {
+      if b.get(i).unwrap_or(0) == 93 && close < 0 {
+        close = i;
+      }
+      i = i + 1;
+    }
+    if close < 2 || close + 1 >= n || b.get(close + 1).unwrap_or(0) != 58 {
+      return None;
+    }
+    host_bytes = b.slice(1, close).unwrap_or(Bytes.new());
+    port_start = close + 2;
+  } else {
+    let mut colon = 0 - 1;
+    let mut i = 0;
+    while i < n {
+      if b.get(i).unwrap_or(0) == 58 {
+        colon = i;
+      }
+      i = i + 1;
+    }
+    if colon < 1 {
+      return None;
+    }
+    host_bytes = b.slice(0, colon).unwrap_or(Bytes.new());
+    // IPv4 や名前の側に `:` があれば括弧のない IPv6 なので拒否する（曖昧さを避ける）。
+    let mut j = 0;
+    while j < host_bytes.byte_len() {
+      if host_bytes.get(j).unwrap_or(0) == 58 {
+        return None;
+      }
+      j = j + 1;
+    }
+    port_start = colon + 1;
+  }
+  let host = host_bytes.to_string_utf8().unwrap_or("");
+  if !host_ok(&host) {
+    return None;
+  }
+  let port_text = b.slice(port_start, n).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+  match parse_uint(&port_text, 5) {
+    None => {
+      return None;
+    }
+    Some(port) => {
+      if port < 1 || port > 65535 {
+        return None;
+      }
+      return Some(Config { host: host, port: port, root: "", max_body: 0 });
+    }
+  }
+}
+
+fn name_of(a: &String) -> String
+  intent "`--name=value` または `--name` から name を取り出す（`--` なしの引数は空文字列）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = a.as_bytes();
+  if b.byte_len() < 3 || b.get(0).unwrap_or(0) != 45 || b.get(1).unwrap_or(0) != 45 {
+    return "";
+  }
+  let mut end = b.byte_len();
+  let mut i = 2;
+  while i < b.byte_len() {
+    if b.get(i).unwrap_or(0) == 61 && end == b.byte_len() {
+      end = i;
+    }
+    i = i + 1;
+  }
+  return b.slice(2, end).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+}
+
+fn has_inline_value(a: &String) -> Bool
+  intent "`--name=value` の形か"
+  requires none
+  ensures none
+  effects none
+{
+  let b = a.as_bytes();
+  let mut i = 2;
+  while i < b.byte_len() {
+    if b.get(i).unwrap_or(0) == 61 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn inline_value(a: &String) -> String
+  intent "`--name=value` の value（最初の `=` より後）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = a.as_bytes();
+  let mut i = 2;
+  while i < b.byte_len() {
+    if b.get(i).unwrap_or(0) == 61 {
+      return b.slice(i + 1, b.byte_len()).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+// 起動引数から取り出した値。set は指定の有無（空文字列を値として渡す指定と区別する）。
+struct Given {
+  listen: Option<String>,
+  root: Option<String>,
+  max_body: Option<String>,
+}
+
+fn read_args(args: &List<String>) -> Result<Given, String>
+  intent "起動引数を `--name value` / `--name=value` として読む。未知のオプション・値の欠落・重複・位置引数は Err"
+  requires none
+  ensures none
+  effects none
+{
+  let mut given = Given { listen: None, root: None, max_body: None };
+  let mut i = 0;
+  while i < args.len() {
+    let a = match args.get(i) {
+      Some(s) => s.clone(),
+      None => "",
+    };
+    let name = name_of(&a);
+    if name == "" {
+      return Err("sigix: 引数の形が不正です（--listen / --root / --max-response-body のみ）");
+    }
+    let mut value = "";
+    if has_inline_value(&a) {
+      value = inline_value(&a);
+    } else {
+      if i + 1 >= args.len() {
+        return Err("sigix: オプションの値がありません");
+      }
+      i = i + 1;
+      value = match args.get(i) {
+        Some(s) => s.clone(),
+        None => "",
+      };
+    }
+    if name == "listen" {
+      if given.listen.is_some() {
+        return Err("sigix: --listen が重複しています");
+      }
+      given.listen = Some(value);
+    } else {
+      if name == "root" {
+        if given.root.is_some() {
+          return Err("sigix: --root が重複しています");
+        }
+        given.root = Some(value);
+      } else {
+        if name == "max-response-body" {
+          if given.max_body.is_some() {
+            return Err("sigix: --max-response-body が重複しています");
+          }
+          given.max_body = Some(value);
+        } else {
+          return Err("sigix: 不明なオプションです（--listen / --root / --max-response-body のみ）");
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(given);
+}
+
+// 起動引数と環境変数の値から設定を組み立てる（副作用なし。環境変数の読み出しは呼び出し側）。
+pub fn resolve(args: &List<String>, env_listen: Option<String>, env_root: Option<String>, env_max: Option<String>) -> Result<Config, String>
+  intent "起動引数 > 環境変数 > 既定値の順で設定を決め、不正・範囲外の値は Err にする"
+  requires none
+  ensures none
+  effects none
+{
+  let given = read_args(&args)?;
+  let listen_text = match given.listen {
+    Some(v) => v,
+    None => env_listen.unwrap_or("127.0.0.1:8080"),
+  };
+  let root_text = match given.root {
+    Some(v) => v,
+    None => env_root.unwrap_or(""),
+  };
+  let max_given = given.max_body.is_some() || env_max.is_some();
+  let max_default = http.default_limits().response_body();
+  let max_text = match given.max_body {
+    Some(v) => v,
+    None => match env_max {
+      Some(v) => v,
+      None => "",
+    },
+  };
+  let parsed = parse_listen(&listen_text);
+  if parsed.is_none() {
+    return Err("sigix: --listen / SIGIX_LISTEN が不正です（例: 127.0.0.1:8080、[::1]:8080。ポートは 1〜65535）");
+  }
+  let listen = parsed.unwrap_or(Config { host: "", port: 0, root: "", max_body: 0 });
+  if root_text.byte_len() == 0 || root_text.as_bytes().get(0).unwrap_or(0) == 0 {
+    return Err("sigix: --root / SIGIX_ROOT が必要です");
+  }
+  let mut max_body = max_default;
+  if max_text.byte_len() > 0 {
+    max_body = match parse_uint(&max_text, 9) {
+      Some(v) => v,
+      None => 0,
+    };
+  } else {
+    if max_given {
+      return Err("sigix: --max-response-body が不正です（1〜67108864）");
+    }
+  }
+  if max_body < 1 || max_body > 67108864 {
+    return Err("sigix: --max-response-body / SIGIX_MAX_RESPONSE_BODY が範囲外です（1〜67108864）");
+  }
+  return Ok(Config { host: listen.host, port: listen.port, root: root_text, max_body: max_body });
+}
+
+pub fn load_config(args: &List<String>) -> Result<Config, String>
+  intent "環境変数 SIGIX_LISTEN・SIGIX_ROOT・SIGIX_MAX_RESPONSE_BODY を読み、起動引数と合わせて設定を決める"
+  requires none
+  ensures none
+  effects env
+{
+  return resolve(&args, env.get(&"SIGIX_LISTEN"), env.get(&"SIGIX_ROOT"), env.get(&"SIGIX_MAX_RESPONSE_BODY"));
+}
