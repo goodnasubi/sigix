@@ -4,6 +4,11 @@ module test_runner
 
 use tests.test_config.run_config_tests;
 use tests.test_mime.run_mime_tests;
+use tests.test_proxy.run_conditional_tests;
+use tests.test_proxy.run_forward_tests;
+use tests.test_proxy.run_header_tests;
+use tests.test_proxy.run_response_tests;
+use tests.test_proxy.run_routes_tests;
 use tests.test_serve.run_log_tests;
 use tests.test_serve.run_serve_tests;
 use tests.test_target.run_target_tests;
@@ -12,7 +17,7 @@ pub fn main() -> Int
   intent "すべての単体テストを実行し、全合格なら 0、不合格があれば失敗した群の番号を返す"
   requires none
   ensures none
-  effects clock, console, fs
+  effects clock, console, fs, task.share, task.suspend
 {
   if !run_target_tests() {
     return 1;
@@ -28,6 +33,21 @@ pub fn main() -> Int
   }
   if !run_log_tests() {
     return 5;
+  }
+  if !run_header_tests() {
+    return 6;
+  }
+  if !run_response_tests() {
+    return 7;
+  }
+  if !run_conditional_tests() {
+    return 8;
+  }
+  if !run_routes_tests() {
+    return 9;
+  }
+  if !run_forward_tests() {
+    return 10;
   }
   return 0;
 }

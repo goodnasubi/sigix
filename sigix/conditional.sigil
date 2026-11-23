@@ -1,0 +1,245 @@
+module sigix.conditional
+  targets server
+  trust none
+
+use sigix.text.decimal;
+use sigix.text.hex;
+use sigix.text.parse_dec;
+use sigix.text.split_commas;
+use sigix.text.sub;
+use sigix.text.trim_ows;
+
+// 条件付き GET（ADR 0056 決定 5(c)）。ETag は `File.byte_len` と `File.mtime` から作る弱い検証子ではなく、
+// 大きさと更新時刻（秒）の組を強い ETag として使う。If-None-Match があれば If-Modified-Since は見ない（RFC 9110 §13.1.3）。
+
+pub fn etag(size: Int, mtime: Int) -> Bytes
+  intent "大きさと更新時刻（unix 秒）から ETag（引用符つき）を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(34);
+  b.extend(&hex(size));
+  b.push(45);
+  b.extend(&hex(mtime));
+  b.push(34);
+  return b;
+}
+
+fn pad2(n: Int) -> Bytes
+  intent "0 以上 99 以下の整数を 2 桁にそろえる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  if n < 10 {
+    b.push(48);
+  }
+  b.extend(&decimal(n));
+  return b;
+}
+
+fn day_names() -> Bytes
+  intent "曜日の略称（日曜始まり、3 バイトずつ）"
+  requires none
+  ensures none
+  effects none
+{
+  return "SunMonTueWedThuFriSat".as_bytes();
+}
+
+fn month_names() -> Bytes
+  intent "月の略称（3 バイトずつ）"
+  requires none
+  ensures none
+  effects none
+{
+  return "JanFebMarAprMayJunJulAugSepOctNovDec".as_bytes();
+}
+
+// 1970-01-01 からの日数を (年, 月, 日) にする（Howard Hinnant の civil_from_days）。
+struct Civil {
+  year: Int,
+  month: Int,
+  day: Int,
+}
+
+fn civil(days: Int) -> Civil
+  intent "1970-01-01 からの日数を年月日にする"
+  requires 0 <= days
+  ensures none
+  effects none
+{
+  let z = days + 719468;
+  let era = z / 146097;
+  let doe = z - era * 146097;
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  let mp = (5 * doy + 2) / 153;
+  let day = doy - (153 * mp + 2) / 5 + 1;
+  let mut month = mp + 3;
+  if mp >= 10 {
+    month = mp - 9;
+  }
+  let mut year = yoe + era * 400;
+  if month <= 2 {
+    year = year + 1;
+  }
+  return Civil { year: year, month: month, day: day };
+}
+
+fn days_from_civil(year: Int, month: Int, day: Int) -> Int
+  intent "年月日を 1970-01-01 からの日数にする"
+  requires 1970 <= year
+  ensures none
+  effects none
+{
+  let mut y = year;
+  if month <= 2 {
+    y = y - 1;
+  }
+  let era = y / 400;
+  let yoe = y - era * 400;
+  let mut mp = month - 3;
+  if month <= 2 {
+    mp = month + 9;
+  }
+  let doy = (153 * mp + 2) / 5 + day - 1;
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+pub fn http_date(secs: Int) -> Bytes
+  intent "unix 秒を IMF-fixdate（例 Sun, 06 Nov 1994 08:49:37 GMT）にする。負は 0 として扱う"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = secs;
+  if t < 0 {
+    t = 0;
+  }
+  let days = t / 86400;
+  let rest = t - days * 86400;
+  let c = civil(days);
+  let wd = (days + 4) % 7;
+  let mut b = Bytes.new();
+  b.extend(&sub(&day_names(), wd * 3, wd * 3 + 3));
+  b.push(44);
+  b.push(32);
+  b.extend(&pad2(c.day));
+  b.push(32);
+  b.extend(&sub(&month_names(), (c.month - 1) * 3, (c.month - 1) * 3 + 3));
+  b.push(32);
+  b.extend(&decimal(c.year));
+  b.push(32);
+  b.extend(&pad2(rest / 3600));
+  b.push(58);
+  b.extend(&pad2(rest % 3600 / 60));
+  b.push(58);
+  b.extend(&pad2(rest % 60));
+  b.extend(&" GMT".as_bytes());
+  return b;
+}
+
+fn month_of(name: &Bytes) -> Int
+  intent "月の略称（3 バイト）を 1〜12 にする（不明は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  let names = month_names();
+  let mut m = 0;
+  while m < 12 {
+    if sub(&names, m * 3, m * 3 + 3) == name {
+      return m + 1;
+    }
+    m = m + 1;
+  }
+  return 0;
+}
+
+fn two(b: &Bytes, at: Int) -> Int
+  intent "at から 2 桁の数字を読む（不正なら -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return parse_dec(&sub(&b, at, at + 2)).unwrap_or(-1);
+}
+
+// IMF-fixdate だけを読む（`Sun, 06 Nov 1994 08:49:37 GMT`、29 バイト固定）。古い 2 形式は対応しない（読めなければ None で、
+// If-Modified-Since は無視して通常の 200 にする）。
+pub fn parse_http_date(v: &Bytes) -> Option<Int>
+  intent "IMF-fixdate を unix 秒にする。形が違う・範囲外は None"
+  requires none
+  ensures none
+  effects none
+{
+  if v.byte_len() != 29 {
+    return None;
+  }
+  if sub(&v, 3, 5) != ", ".as_bytes() || v.get(7).unwrap_or(0) != 32 || v.get(11).unwrap_or(0) != 32 || v.get(16).unwrap_or(0) != 32 || v.get(19).unwrap_or(0) != 58 || v.get(22).unwrap_or(0) != 58 || sub(&v, 25, 29) != " GMT".as_bytes() {
+    return None;
+  }
+  let day = two(&v, 5);
+  let month = month_of(&sub(&v, 8, 11));
+  let year = parse_dec(&sub(&v, 12, 16)).unwrap_or(0);
+  let hour = two(&v, 17);
+  let minute = two(&v, 20);
+  let second = two(&v, 23);
+  if day < 1 || day > 31 || month < 1 || year < 1970 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60 {
+    return None;
+  }
+  let days = days_from_civil(year, month, day);
+  return Some(days * 86400 + hour * 3600 + minute * 60 + second);
+}
+
+fn strip_weak(tag: &Bytes) -> Bytes
+  intent "弱い検証子の接頭辞 W/ を外す（If-None-Match は弱い比較）"
+  requires none
+  ensures none
+  effects none
+{
+  if tag.byte_len() >= 2 && tag.get(0).unwrap_or(0) == 87 && tag.get(1).unwrap_or(0) == 47 {
+    return sub(&tag, 2, tag.byte_len());
+  }
+  return tag.clone();
+}
+
+pub fn not_modified(inm: &Option<Bytes>, ims: &Option<Bytes>, tag: &Bytes, mtime: Int) -> Bool
+  intent "If-None-Match / If-Modified-Since から、304 を返してよいか決める"
+  requires none
+  ensures none
+  effects none
+{
+  match inm {
+    Some(v) => {
+      let items = split_commas(&v);
+      let mut i = 0;
+      while i < items.len() {
+        match items.get(i) {
+          None => {}
+          Some(item) => {
+            let t = trim_ows(&item);
+            if t == "*".as_bytes() || strip_weak(&t) == tag.clone() {
+              return true;
+            }
+          }
+        }
+        i = i + 1;
+      }
+      return false;
+    }
+    None => {}
+  }
+  return match ims {
+    Some(v) => match parse_http_date(&v) {
+      Some(since) => mtime <= since,
+      None => false,
+    },
+    None => false,
+  };
+}

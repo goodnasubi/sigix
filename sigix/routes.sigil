@@ -1,0 +1,694 @@
+module sigix.routes
+  targets server
+  trust none
+
+use sigix.config.parse_listen;
+use sigix.config.parse_uint;
+use sigix.headers.HostMode;
+use sigix.text.starts_with_at;
+
+// JSON 設定（ADR 0056 決定 2・6）。複数の経路接頭辞ごとに、静的配信かリバースプロキシかを決める。
+// 不明なキー・型の違い・範囲外・不正なアドレスはすべて起動時に拒否する（fail-closed）。再読込は再起動のみ。
+//
+//   {
+//     "listen": "127.0.0.1:8080",
+//     "max_response_body": 1048576,
+//     "trusted_proxies": ["127.0.0.1", "::1", "10.0.0.0/8"],
+//     "connect_timeout_ms": 3000,
+//     "read_timeout_ms": 30000,
+//     "routes": [
+//       { "prefix": "/api/", "type": "proxy", "backends": ["127.0.0.1:9000", "127.0.0.1:9001"], "host": "preserve" },
+//       { "prefix": "/", "type": "static", "root": "/srv/www" }
+//     ]
+//   }
+
+pub struct Backend {
+  host: String,
+  port: Int,
+}
+
+pub struct Route {
+  prefix: String,
+  proxy: Bool,
+  root: String,
+  backends: List<Backend>,
+  host_mode: HostMode,
+}
+
+pub struct Settings {
+  listen: Option<String>,
+  max_body: Option<Int>,
+  trusted: List<String>,
+  connect_ms: Int,
+  read_ms: Int,
+  routes: List<Route>,
+}
+
+pub fn static_route(prefix: &String, root: &String) -> Route
+  intent "静的配信の経路を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Route { prefix: prefix.clone(), proxy: false, root: root.clone(), backends: List.new(), host_mode: HostMode.Preserve };
+}
+
+pub fn default_trusted() -> List<String>
+  intent "信頼する接続元の既定（ループバックだけ）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push("127.0.0.1");
+  l.push("::1");
+  return l;
+}
+
+pub fn single_static(root: &String) -> Settings
+  intent "段階 1 の互換: `--root` だけのとき、`/` 全体を静的配信する設定"
+  requires none
+  ensures none
+  effects none
+{
+  let mut routes = List.new();
+  routes.push(static_route(&"/", &root));
+  return Settings { listen: None, max_body: None, trusted: default_trusted(), connect_ms: 3000, read_ms: 30000, routes: routes };
+}
+
+fn split_on(b: &Bytes, sep: Int) -> List<Bytes>
+  intent "区切りのバイトで分ける（空の要素も残す）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut cur = Bytes.new();
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == sep {
+      out.push(cur);
+      cur = Bytes.new();
+    } else {
+      cur.push(c);
+    }
+    i = i + 1;
+  }
+  out.push(cur);
+  return out;
+}
+
+fn ipv4_ok(s: &String) -> Bool
+  intent "ドット区切りの IPv4 数値アドレスか"
+  requires none
+  ensures none
+  effects none
+{
+  let parts = split_on(&s.as_bytes(), 46);
+  if parts.len() != 4 {
+    return false;
+  }
+  let mut i = 0;
+  while i < 4 {
+    let text = match parts.get(i) {
+      Some(p) => p.to_string_utf8().unwrap_or(""),
+      None => "",
+    };
+    match parse_uint(&text, 3) {
+      None => {
+        return false;
+      }
+      Some(n) => {
+        if n > 255 {
+          return false;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn ipv6_ok(s: &String) -> Bool
+  intent "IPv6 数値アドレスらしいか（16 進・コロン・ドットだけで、コロンが 2 つ以上）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  if b.byte_len() < 2 || b.byte_len() > 45 {
+    return false;
+  }
+  let mut colons = 0;
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 58 {
+      colons = colons + 1;
+    } else {
+      let digit = c >= 48 && c <= 57;
+      let lower = c >= 97 && c <= 102;
+      let upper = c >= 65 && c <= 70;
+      if !digit && !lower && !upper && c != 46 {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return colons >= 2;
+}
+
+fn ip_ok(s: &String) -> Bool
+  intent "数値の IP アドレス（IPv4 / IPv6）か。名前解決はしないので、ホスト名は受け付けない"
+  requires none
+  ensures none
+  effects none
+{
+  return ipv4_ok(&s) || ipv6_ok(&s);
+}
+
+fn trusted_ok(s: &String) -> Bool
+  intent "信頼する接続元の 1 項目として正しいか（IPv4 は /0〜/32 の CIDR 可、IPv6 は単一アドレスのみ）"
+  requires none
+  ensures none
+  effects none
+{
+  let parts = split_on(&s.as_bytes(), 47);
+  if parts.len() == 1 {
+    return ip_ok(&s);
+  }
+  if parts.len() != 2 {
+    return false;
+  }
+  let addr = match parts.get(0) {
+    Some(p) => p.to_string_utf8().unwrap_or(""),
+    None => "",
+  };
+  let bits = match parts.get(1) {
+    Some(p) => p.to_string_utf8().unwrap_or(""),
+    None => "",
+  };
+  if !ipv4_ok(&addr) {
+    return false;
+  }
+  return match parse_uint(&bits, 2) {
+    Some(n) => n <= 32,
+    None => false,
+  };
+}
+
+fn prefix_ok(p: &String) -> Bool
+  intent "経路接頭辞として正しいか（`/` で始まり `/` で終わる。`//`・`.`・制御文字・非 ASCII を含まない）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = p.as_bytes();
+  if b.byte_len() < 1 || b.get(0).unwrap_or(0) != 47 || b.get(b.byte_len() - 1).unwrap_or(0) != 47 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c < 33 || c > 126 || c == 46 || c == 92 || c == 37 || c == 63 || c == 35 {
+      return false;
+    }
+    if i > 0 && c == 47 && b.get(i - 1).unwrap_or(0) == 47 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn at_of(items: &List<Int>, i: Int) -> Int
+  intent "配列の i 番目の要素（ノード番号）。範囲外は 0"
+  requires none
+  ensures none
+  effects none
+{
+  return match items.get(i) {
+    Some(v) => v + 0,
+    None => 0,
+  };
+}
+
+fn str_at(nodes: &List<JsonNode>, i: Int) -> Option<String>
+  intent "ノードが文字列ならその値"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(i) {
+    Some(n) => match n {
+      JsonNode.Str(s) => Some(s.clone()),
+      _ => None,
+    },
+    None => None,
+  };
+}
+
+fn int_at(nodes: &List<JsonNode>, i: Int) -> Option<Int>
+  intent "ノードが整数ならその値"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(i) {
+    Some(n) => match n {
+      JsonNode.Int(v) => Some(v + 0),
+      _ => None,
+    },
+    None => None,
+  };
+}
+
+fn items_at(nodes: &List<JsonNode>, i: Int) -> Option<List<Int>>
+  intent "ノードが配列ならその要素のノード番号の一覧"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(i) {
+    Some(n) => match n {
+      JsonNode.Array(items) => Some(items.clone()),
+      _ => None,
+    },
+    None => None,
+  };
+}
+
+fn fields_at(nodes: &List<JsonNode>, i: Int) -> Option<List<JsonField>>
+  intent "ノードがオブジェクトならそのフィールドの一覧"
+  requires none
+  ensures none
+  effects none
+{
+  return match nodes.get(i) {
+    Some(n) => match n {
+      JsonNode.Object(flds) => Some(flds.clone()),
+      _ => None,
+    },
+    None => None,
+  };
+}
+
+// オブジェクトのキーを検査し、許可された名前だけで重複が無いかを確かめる。
+fn keys_ok(fields: &List<JsonField>, allowed: &List<String>) -> Bool
+  intent "オブジェクトのキーがすべて許可された名前で、重複が無いか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut seen = List.new();
+  let mut i = 0;
+  while i < fields.len() {
+    let name = match fields.get(i) {
+      Some(f) => f.name(),
+      None => "",
+    };
+    if allowed.find(|a| a == name).is_none() {
+      return false;
+    }
+    if seen.find(|a| a == name).is_some() {
+      return false;
+    }
+    seen.push(name);
+    i = i + 1;
+  }
+  return true;
+}
+
+fn field(fields: &List<JsonField>, name: &String) -> Option<Int>
+  intent "オブジェクトから、名前のフィールドのノード番号を探す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      None => {}
+      Some(f) => {
+        if f.name() == name {
+          return Some(f.index());
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn names(a: &String, b: &String, c: &String, d: &String, e: &String) -> List<String>
+  intent "許可するキー名の一覧を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a.clone());
+  l.push(b.clone());
+  l.push(c.clone());
+  l.push(d.clone());
+  l.push(e.clone());
+  return l;
+}
+
+fn parse_backends(nodes: &List<JsonNode>, idx: Int) -> Result<List<Backend>, String>
+  intent "backends（`IP:ポート` の配列）を読む。空・不正なアドレス・名前解決が要るホスト名は Err"
+  requires none
+  ensures none
+  effects none
+{
+  let mut items = List.new();
+  match items_at(&nodes, idx) {
+    Some(l) => {
+      items = l;
+    }
+    None => {
+      return Err("sigix: backends は配列で指定してください");
+    }
+  }
+  if items.len() < 1 || items.len() > 64 {
+    return Err("sigix: backends は 1〜64 個で指定してください");
+  }
+  let mut out = List.new();
+  let mut i = 0;
+  while i < items.len() {
+    let at = at_of(&items, i);
+    let mut text = "";
+    match str_at(&nodes, at) {
+      Some(s) => {
+        text = s;
+      }
+      None => {
+        return Err("sigix: backends の要素は \"IP:ポート\" の文字列です");
+      }
+    }
+    match parse_listen(&text) {
+      None => {
+        return Err("sigix: backends の形が不正です（例: 127.0.0.1:9000、[::1]:9000）");
+      }
+      Some(c) => {
+        if !ip_ok(&c.host) {
+          return Err("sigix: backends は数値の IP アドレスで指定してください（名前解決はしません）");
+        }
+        out.push(Backend { host: c.host.clone(), port: c.port });
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+fn parse_route(nodes: &List<JsonNode>, idx: Int) -> Result<Route, String>
+  intent "経路 1 件を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut fields = List.new();
+  match fields_at(&nodes, idx) {
+    Some(f) => {
+      fields = f;
+    }
+    None => {
+      return Err("sigix: routes の要素はオブジェクトです");
+    }
+  }
+  if !keys_ok(&fields, &names(&"prefix", &"type", &"root", &"backends", &"host")) {
+    return Err("sigix: routes に不明または重複したキーがあります（prefix / type / root / backends / host）");
+  }
+  let prefix = match field(&fields, &"prefix") {
+    Some(i) => str_at(&nodes, i),
+    None => None,
+  };
+  let kind = match field(&fields, &"type") {
+    Some(i) => str_at(&nodes, i),
+    None => None,
+  };
+  let pfx = prefix.clone().unwrap_or("");
+  if prefix.is_none() || !prefix_ok(&pfx) {
+    return Err("sigix: prefix が不正です（`/` で始まり `/` で終わる。例: /api/）");
+  }
+  let k = kind.unwrap_or("");
+  if k == "static" {
+    if field(&fields, &"backends").is_some() || field(&fields, &"host").is_some() {
+      return Err("sigix: static の経路に backends / host は指定できません");
+    }
+    let root = match field(&fields, &"root") {
+      Some(i) => str_at(&nodes, i),
+      None => None,
+    };
+    let r = root.unwrap_or("");
+    if r.byte_len() == 0 || r.as_bytes().get(0).unwrap_or(0) == 0 {
+      return Err("sigix: static の経路には root が必要です");
+    }
+    return Ok(static_route(&pfx, &r));
+  }
+  if k == "proxy" {
+    if field(&fields, &"root").is_some() {
+      return Err("sigix: proxy の経路に root は指定できません");
+    }
+    let mut bi = 0;
+    match field(&fields, &"backends") {
+      Some(i) => {
+        bi = i;
+      }
+      None => {
+        return Err("sigix: proxy の経路には backends が必要です");
+      }
+    }
+    let backends = parse_backends(&nodes, bi)?;
+    let mut mode = HostMode.Preserve;
+    match field(&fields, &"host") {
+      None => {}
+      Some(i) => {
+        let text = str_at(&nodes, i).unwrap_or("");
+        if text == "backend" {
+          mode = HostMode.Upstream;
+        } else {
+          if text != "preserve" {
+            return Err("sigix: host は \"preserve\" か \"backend\" です");
+          }
+        }
+      }
+    }
+    return Ok(Route { prefix: pfx, proxy: true, root: "", backends: backends, host_mode: mode });
+  }
+  return Err("sigix: type は \"static\" か \"proxy\" です");
+}
+
+// 長い接頭辞が先に並ぶよう、挿入しながら並べる。同じ接頭辞は拒否する。
+fn insert_sorted(routes: &List<Route>, r: Route) -> Result<List<Route>, String>
+  intent "接頭辞の長い順に経路を挿入する（同じ接頭辞は Err）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut placed = false;
+  let mut i = 0;
+  while i < routes.len() {
+    match routes.get(i) {
+      None => {}
+      Some(e) => {
+        if e.prefix == r.prefix {
+          return Err("sigix: 同じ prefix の経路が重複しています");
+        }
+        if !placed && r.prefix.byte_len() > e.prefix.byte_len() {
+          out.push(Route { prefix: r.prefix.clone(), proxy: r.proxy, root: r.root.clone(), backends: r.backends.clone(), host_mode: r.host_mode.clone() });
+          placed = true;
+        }
+        out.push(Route { prefix: e.prefix.clone(), proxy: e.proxy, root: e.root.clone(), backends: e.backends.clone(), host_mode: e.host_mode.clone() });
+      }
+    }
+    i = i + 1;
+  }
+  if !placed {
+    out.push(r);
+  }
+  return Ok(out);
+}
+
+fn bounded(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String, lo: Int, hi: Int, fallback: Int) -> Result<Int, String>
+  intent "整数の設定を範囲つきで読む（無ければ既定値、型の違い・範囲外は Err）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = fallback;
+  match field(&fields, &name) {
+    None => {}
+    Some(i) => {
+      match int_at(&nodes, i) {
+        None => {
+          return Err("sigix: 設定の数値が不正です（整数で指定してください）");
+        }
+        Some(v) => {
+          if v < lo || v > hi {
+            return Err("sigix: 設定の数値が範囲外です（connect_timeout_ms 1〜60000、read_timeout_ms 1〜300000、max_response_body 1〜67108864）");
+          }
+          out = v;
+        }
+      }
+    }
+  }
+  return Ok(out);
+}
+
+pub fn parse_settings(data: &Bytes) -> Result<Settings, String>
+  intent "JSON の設定を読む。不正な JSON・不明なキー・範囲外・不正なアドレス・重複した prefix は Err（fail-closed）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut doc = JsonValue.new(List.new(), 0);
+  match json.parse(&data) {
+    Ok(d) => {
+      doc = d;
+    }
+    Err(_) => {
+      return Err("sigix: 設定ファイルが正しい JSON ではありません");
+    }
+  }
+  let nodes = doc.nodes();
+  let mut fields = List.new();
+  match fields_at(&nodes, doc.root()) {
+    Some(f) => {
+      fields = f;
+    }
+    None => {
+      return Err("sigix: 設定ファイルの最上位はオブジェクトです");
+    }
+  }
+  let mut allowed = names(&"listen", &"max_response_body", &"trusted_proxies", &"connect_timeout_ms", &"read_timeout_ms");
+  allowed.push("routes");
+  if !keys_ok(&fields, &allowed) {
+    return Err("sigix: 設定ファイルに不明または重複したキーがあります");
+  }
+  let mut listen = None;
+  match field(&fields, &"listen") {
+    None => {}
+    Some(i) => {
+      match str_at(&nodes, i) {
+        None => {
+          return Err("sigix: listen は文字列で指定してください");
+        }
+        Some(s) => {
+          if parse_listen(&s).is_none() {
+            return Err("sigix: listen が不正です");
+          }
+          listen = Some(s);
+        }
+      }
+    }
+  }
+  let mut max_body = None;
+  if field(&fields, &"max_response_body").is_some() {
+    max_body = Some(bounded(&nodes, &fields, &"max_response_body", 1, 67108864, 1)?);
+  }
+  let mut connect_ms = 3000;
+  match bounded(&nodes, &fields, &"connect_timeout_ms", 1, 60000, 3000) {
+    Err(m) => {
+      return Err(m);
+    }
+    Ok(v) => {
+      connect_ms = v;
+    }
+  }
+  let mut read_ms = 30000;
+  match bounded(&nodes, &fields, &"read_timeout_ms", 1, 300000, 30000) {
+    Err(m) => {
+      return Err(m);
+    }
+    Ok(v) => {
+      read_ms = v;
+    }
+  }
+  let mut trusted = default_trusted();
+  match field(&fields, &"trusted_proxies") {
+    None => {}
+    Some(i) => {
+      let mut items = List.new();
+      match items_at(&nodes, i) {
+        Some(l) => {
+          items = l;
+        }
+        None => {
+          return Err("sigix: trusted_proxies は配列で指定してください");
+        }
+      }
+      trusted = List.new();
+      let mut k = 0;
+      while k < items.len() {
+        let at = at_of(&items, k);
+        match str_at(&nodes, at) {
+          None => {
+            return Err("sigix: trusted_proxies の要素は文字列です");
+          }
+          Some(s) => {
+            if !trusted_ok(&s) {
+              return Err("sigix: trusted_proxies の形が不正です（IPv4 / IPv4 の CIDR / IPv6 の単一アドレス）");
+            }
+            trusted.push(s);
+          }
+        }
+        k = k + 1;
+      }
+    }
+  }
+  let mut ri = 0;
+  match field(&fields, &"routes") {
+    Some(i) => {
+      ri = i;
+    }
+    None => {
+      return Err("sigix: routes が必要です");
+    }
+  }
+  let mut items = List.new();
+  match items_at(&nodes, ri) {
+    Some(l) => {
+      items = l;
+    }
+    None => {
+      return Err("sigix: routes は配列で指定してください");
+    }
+  }
+  if items.len() < 1 || items.len() > 64 {
+    return Err("sigix: routes は 1〜64 件で指定してください");
+  }
+  let mut routes = List.new();
+  let mut k = 0;
+  while k < items.len() {
+    let at = at_of(&items, k);
+    let r = parse_route(&nodes, at)?;
+    routes = insert_sorted(&routes, r)?;
+    k = k + 1;
+  }
+  return Ok(Settings { listen: listen, max_body: max_body, trusted: trusted, connect_ms: connect_ms, read_ms: read_ms, routes: routes });
+}
+
+pub fn find_route(settings: &Settings, path: &Bytes) -> Option<Int>
+  intent "経路に一致する最初（最長）の経路の番号。無ければ None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < settings.routes.len() {
+    match settings.routes.get(i) {
+      None => {}
+      Some(r) => {
+        if starts_with_at(&path, 0, &r.prefix.as_bytes()) {
+          return Some(i);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return None;
+}

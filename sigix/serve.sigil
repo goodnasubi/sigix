@@ -2,6 +2,9 @@ module sigix.serve
   targets server
   trust none
 
+use sigix.conditional.etag;
+use sigix.conditional.http_date;
+use sigix.conditional.not_modified;
 use sigix.mime.mime_type;
 use sigix.target.Target;
 use sigix.target.decode_target;
@@ -20,7 +23,8 @@ fn chunk_size() -> Int
 }
 
 enum Fetched {
-  Found(Bytes),
+  Found(Bytes, Int, Int),
+  NotModified(Bytes, Int),
   Missing,
   Directory,
   TooLarge,
@@ -42,7 +46,13 @@ fn zero_chunk() -> Bytes
   return buf;
 }
 
-fn fetch(dir: &Dir, rel: &String, max_body: Int) -> Fetched
+// 条件付き GET の検証子（If-None-Match / If-Modified-Since の値）。
+struct Cond {
+  inm: Option<Bytes>,
+  ims: Option<Bytes>,
+}
+
+fn fetch(dir: &Dir, rel: &String, max_body: Int, cond: &Cond) -> Fetched
   intent "公開ルートの `Dir` 起点でファイルを開き、応答本文の上限までだけ読む。上限を超えたら全量を読まずに TooLarge"
   requires 1 <= max_body
   ensures none
@@ -64,6 +74,27 @@ fn fetch(dir: &Dir, rel: &String, max_body: Int) -> Fetched
           };
         }
         Ok(_) => {}
+      }
+      let size = match file.byte_len() {
+        Ok(n) => n,
+        Err(_) => 0 - 1,
+      };
+      let mtime = match file.mtime() {
+        Ok(t) => t,
+        Err(_) => 0 - 1,
+      };
+      if size < 0 || mtime < 0 {
+        let _ = file.close();
+        return Fetched.Failed;
+      }
+      if size > max_body {
+        let _ = file.close();
+        return Fetched.TooLarge;
+      }
+      let tag = etag(size, mtime);
+      if not_modified(&cond.inm, &cond.ims, &tag, mtime) {
+        let _ = file.close();
+        return Fetched.NotModified(tag, mtime);
       }
       let mut buf = zero_chunk();
       let mut body = Bytes.new();
@@ -98,7 +129,7 @@ fn fetch(dir: &Dir, rel: &String, max_body: Int) -> Fetched
       if verdict == 2 {
         return Fetched.Failed;
       }
-      return Fetched.Found(body);
+      return Fetched.Found(body, size, mtime);
     }
   }
 }
@@ -112,14 +143,23 @@ fn plain(status: Int, text: &String) -> HttpResponse
   return HttpResponse.new(status, text.as_bytes()).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
 }
 
-fn ok_file(body: Bytes, name: &String) -> HttpResponse
-  intent "200 でファイルの本文を返す。Content-Type は拡張子の表で決める（Content-Length は std.http が付ける）"
+fn ok_file(body: Bytes, name: &String, size: Int, mtime: Int) -> HttpResponse
+  intent "200 でファイルの本文を返す。Content-Type は拡張子の表で決め、ETag と Last-Modified を付ける（Content-Length は std.http が付ける）"
   requires none
   ensures none
   effects none
 {
   let mime = mime_type(&name);
-  return HttpResponse.new(200, body).with_header(&"content-type", &mime.as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes());
+  return HttpResponse.new(200, body).with_header(&"content-type", &mime.as_bytes()).with_header(&"x-content-type-options", &"nosniff".as_bytes()).with_header(&"etag", &etag(size, mtime)).with_header(&"last-modified", &http_date(mtime));
+}
+
+fn not_modified_response(tag: &Bytes, mtime: Int) -> HttpResponse
+  intent "304 Not Modified（本文なし）。ETag と Last-Modified を付ける"
+  requires none
+  ensures none
+  effects none
+{
+  return HttpResponse.new(304, Bytes.new()).with_header(&"etag", &tag).with_header(&"last-modified", &http_date(mtime));
 }
 
 fn index_of(rel: &String) -> String
@@ -134,7 +174,7 @@ fn index_of(rel: &String) -> String
   return rel.as_bytes().concat(&"/index.html".as_bytes()).to_string_utf8().unwrap_or("index.html");
 }
 
-fn lookup(dir: &Dir, target: &Target, raw_path: &Bytes, max_body: Int) -> HttpResponse
+fn lookup(dir: &Dir, target: &Target, raw_path: &Bytes, max_body: Int, cond: &Cond) -> HttpResponse
   intent "検査済みの対象を、公開ルートの `Dir` 起点で応答にする"
   requires 1 <= max_body
   ensures none
@@ -143,15 +183,17 @@ fn lookup(dir: &Dir, target: &Target, raw_path: &Bytes, max_body: Int) -> HttpRe
   if target.dir {
     // ディレクトリの要求: 直下の index.html があれば 200、無ければ 404（403 にしない。存在偵察を防ぐ）。
     let index = index_of(&target.rel);
-    return match fetch(&dir, &index, max_body) {
-      Fetched.Found(body) => ok_file(body, &index),
+    return match fetch(&dir, &index, max_body, &cond) {
+      Fetched.Found(body, size, mtime) => ok_file(body, &index, size, mtime),
+      Fetched.NotModified(tag, mtime) => not_modified_response(&tag, mtime),
       Fetched.TooLarge => plain(500, &"Internal Server Error\n"),
       Fetched.Failed => plain(500, &"Internal Server Error\n"),
       _ => plain(404, &"Not Found\n"),
     };
   }
-  return match fetch(&dir, &target.rel, max_body) {
-    Fetched.Found(body) => ok_file(body, &target.rel),
+  return match fetch(&dir, &target.rel, max_body, &cond) {
+    Fetched.Found(body, size, mtime) => ok_file(body, &target.rel, size, mtime),
+    Fetched.NotModified(tag, mtime) => not_modified_response(&tag, mtime),
     Fetched.Directory => HttpResponse.new(301, "Moved Permanently\n".as_bytes()).with_header(&"location", &raw_path.concat(&"/".as_bytes())).with_header(&"content-type", &"text/plain; charset=utf-8".as_bytes()),
     Fetched.TooLarge => plain(500, &"Internal Server Error\n"),
     Fetched.Failed => plain(500, &"Internal Server Error\n"),
@@ -159,8 +201,10 @@ fn lookup(dir: &Dir, target: &Target, raw_path: &Bytes, max_body: Int) -> HttpRe
   };
 }
 
-fn route(root: &String, max_body: Int, req: &HttpRequest) -> HttpResponse
-  intent "メソッドと経路を検査し、公開ルートのファイルへ写して応答にする"
+// 静的配信の本体。rel_path は経路接頭辞を除いた、公開ルートの中の経路（`/` で始まる）。full_path は届いた経路で、301 の
+// Location に使う（接頭辞を含む）。
+pub fn static_response(root: &String, max_body: Int, req: &HttpRequest, rel_path: &Bytes, full_path: &Bytes) -> HttpResponse
+  intent "メソッドと経路を検査し、公開ルートのファイルへ写して応答にする（条件付き GET に対応）"
   requires 1 <= max_body
   ensures none
   effects fs
@@ -169,24 +213,34 @@ fn route(root: &String, max_body: Int, req: &HttpRequest) -> HttpResponse
   if method != "GET" && method != "HEAD" {
     return plain(405, &"Method Not Allowed\n").with_header(&"allow", &"GET, HEAD".as_bytes());
   }
-  let raw_path = req.path();
-  match decode_target(&raw_path) {
+  match decode_target(&rel_path) {
     None => {
       return plain(400, &"Bad Request\n");
     }
     Some(target) => {
+      let cond = Cond { inm: req.header(&"if-none-match"), ims: req.header(&"if-modified-since") };
       match fs.open_dir(&Path.new(&root)) {
         Err(_) => {
           return plain(500, &"Internal Server Error\n");
         }
         Ok(dir) => {
-          let res = lookup(&dir, &target, &raw_path, max_body);
+          let res = lookup(&dir, &target, &full_path, max_body, &cond);
           let _ = dir.close();
           return res;
         }
       }
     }
   }
+}
+
+fn route(root: &String, max_body: Int, req: &HttpRequest) -> HttpResponse
+  intent "段階 1 の経路: 届いた経路をそのまま公開ルートへ写す"
+  requires 1 <= max_body
+  ensures none
+  effects fs
+{
+  let raw_path = req.path();
+  return static_response(&root, max_body, &req, &raw_path, &raw_path);
 }
 
 fn decimal(n: Int) -> Bytes

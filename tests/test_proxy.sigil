@@ -1,0 +1,488 @@
+module tests.test_proxy
+  targets server
+  trust none
+
+use sigix.conditional.etag;
+use sigix.conditional.http_date;
+use sigix.conditional.not_modified;
+use sigix.conditional.parse_http_date;
+use sigix.headers.Hdr;
+use sigix.headers.HostMode;
+use sigix.headers.client_headers;
+use sigix.headers.hdr;
+use sigix.headers.header_value;
+use sigix.headers.source;
+use sigix.headers.upstream_headers;
+use sigix.proxy.build_request;
+use sigix.proxy.initial_cursors;
+use sigix.proxy.next_backend;
+use sigix.respparse.parse_response;
+use sigix.routes.find_route;
+use sigix.routes.parse_settings;
+use sigix.routes.single_static;
+use sigix.text.find_from;
+use sigix.text.starts_with_at;
+use tests.support.fail;
+use tests.support.make_raw_request;
+
+fn text(o: Option<Bytes>) -> String
+  intent "ヘッダの値を文字列にする（無ければ `<none>`）"
+  requires none
+  ensures none
+  effects none
+{
+  return match o {
+    Some(b) => b.to_string_utf8().unwrap_or("<bad>"),
+    None => "<none>",
+  };
+}
+
+fn has_text(b: &Bytes, needle: &String) -> Bool
+  intent "バイト列に文字列が含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  return find_from(&b, &needle.as_bytes(), 0) >= 0;
+}
+
+fn has(hs: &List<Hdr>, name: &String) -> Bool
+  intent "ヘッダがあるか"
+  requires none
+  ensures none
+  effects none
+{
+  return header_value(&hs, &name).is_some();
+}
+
+fn sample() -> List<Hdr>
+  intent "テスト用の要求ヘッダ"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(hdr(&"host", &"example.test".as_bytes()));
+  l.push(hdr(&"connection", &"keep-alive, x-foo".as_bytes()));
+  l.push(hdr(&"x-foo", &"1".as_bytes()));
+  l.push(hdr(&"keep-alive", &"timeout=5".as_bytes()));
+  l.push(hdr(&"te", &"trailers".as_bytes()));
+  l.push(hdr(&"trailer", &"x".as_bytes()));
+  l.push(hdr(&"transfer-encoding", &"chunked".as_bytes()));
+  l.push(hdr(&"upgrade", &"websocket".as_bytes()));
+  l.push(hdr(&"proxy-authorization", &"Basic x".as_bytes()));
+  l.push(hdr(&"proxy-authenticate", &"Basic".as_bytes()));
+  l.push(hdr(&"forwarded", &"for=6.6.6.6".as_bytes()));
+  l.push(hdr(&"x-real-ip", &"6.6.6.6".as_bytes()));
+  l.push(hdr(&"x-forwarded-for", &"1.2.3.4".as_bytes()));
+  l.push(hdr(&"x-forwarded-proto", &"https".as_bytes()));
+  l.push(hdr(&"x-keep", &"yes".as_bytes()));
+  return l;
+}
+
+pub fn run_header_tests() -> Bool
+  intent "プロキシのヘッダ書き換えをテストする"
+  requires none
+  ensures none
+  effects console
+{
+  let req = sample();
+  let untrusted = source(false, &Some("203.0.113.9"));
+  let u = upstream_headers(&req, &untrusted, &HostMode.Preserve, &"127.0.0.1:9000");
+  let mut names = List.new();
+  names.push("connection");
+  names.push("keep-alive");
+  names.push("te");
+  names.push("trailer");
+  names.push("transfer-encoding");
+  names.push("upgrade");
+  names.push("proxy-authorization");
+  names.push("proxy-authenticate");
+  names.push("x-foo");
+  names.push("forwarded");
+  names.push("x-real-ip");
+  let mut i = 0;
+  while i < names.len() {
+    let n = match names.get(i) {
+      Some(x) => x.clone(),
+      None => "",
+    };
+    if has(&u, &n) {
+      return fail(&"headers: 剥がれていない");
+    }
+    i = i + 1;
+  }
+  if text(header_value(&u, &"x-keep")) != "yes" {
+    return fail(&"headers: 通常のヘッダは保つ");
+  }
+  if text(header_value(&u, &"x-forwarded-for")) != "203.0.113.9" {
+    return fail(&"headers: 信頼しない接続元の X-Forwarded-For は捨てて直接の接続元で上書きする");
+  }
+  if text(header_value(&u, &"x-forwarded-proto")) != "http" {
+    return fail(&"headers: 信頼しない接続元の X-Forwarded-Proto は http で上書きする");
+  }
+  if text(header_value(&u, &"host")) != "example.test" {
+    return fail(&"headers: Host を保つ");
+  }
+  let trusted = source(true, &Some("10.0.0.1"));
+  let t = upstream_headers(&req, &trusted, &HostMode.Preserve, &"127.0.0.1:9000");
+  if text(header_value(&t, &"x-forwarded-for")) != "1.2.3.4, 10.0.0.1" {
+    return fail(&"headers: 信頼する接続元は前の値に追記する");
+  }
+  if text(header_value(&t, &"x-forwarded-proto")) != "https" {
+    return fail(&"headers: 信頼する接続元の X-Forwarded-Proto を中継する");
+  }
+  if has(&t, &"forwarded") || has(&t, &"x-real-ip") {
+    return fail(&"headers: Forwarded / X-Real-IP は信頼しても捨てる（sigix が付け直す）");
+  }
+  let unknown = source(false, &None);
+  let k = upstream_headers(&req, &unknown, &HostMode.Preserve, &"127.0.0.1:9000");
+  if has(&k, &"x-forwarded-for") {
+    return fail(&"headers: 接続元が不明なら X-Forwarded-For は付けない（偽装値も通さない）");
+  }
+  if text(header_value(&k, &"x-forwarded-proto")) != "http" {
+    return fail(&"headers: 接続元が不明でも X-Forwarded-Proto は http");
+  }
+  let w = upstream_headers(&req, &untrusted, &HostMode.Upstream, &"127.0.0.1:9000");
+  if text(header_value(&w, &"host")) != "127.0.0.1:9000" {
+    return fail(&"headers: Host を転送先へ書き換える");
+  }
+  let mut no_host = List.new();
+  no_host.push(hdr(&"x-keep", &"yes".as_bytes()));
+  let n = upstream_headers(&no_host, &untrusted, &HostMode.Preserve, &"127.0.0.1:9000");
+  if text(header_value(&n, &"host")) != "127.0.0.1:9000" {
+    return fail(&"headers: Host が無ければ転送先を入れる");
+  }
+  let mut res = List.new();
+  res.push(hdr(&"content-length", &"5".as_bytes()));
+  res.push(hdr(&"connection", &"close, x-bar".as_bytes()));
+  res.push(hdr(&"x-bar", &"1".as_bytes()));
+  res.push(hdr(&"transfer-encoding", &"chunked".as_bytes()));
+  res.push(hdr(&"keep-alive", &"x".as_bytes()));
+  res.push(hdr(&"x-backend", &"A".as_bytes()));
+  let c = client_headers(&res);
+  if c.len() != 1 || text(header_value(&c, &"x-backend")) != "A" {
+    return fail(&"headers: 応答のホップバイホップ・Content-Length を剥がす");
+  }
+  return true;
+}
+
+fn parsed_status(wire: &String, no_body: Bool, max: Int) -> Int
+  intent "応答を読み、状態を返す（読めなければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match parse_response(&wire.as_bytes(), no_body, max) {
+    Some(u) => u.status,
+    None => 0 - 1,
+  };
+}
+
+fn parsed_body(wire: &String, no_body: Bool, max: Int) -> String
+  intent "応答を読み、本文を返す（読めなければ `<none>`）"
+  requires none
+  ensures none
+  effects none
+{
+  return match parse_response(&wire.as_bytes(), no_body, max) {
+    Some(u) => u.body.to_string_utf8().unwrap_or("<bad>"),
+    None => "<none>",
+  };
+}
+
+pub fn run_response_tests() -> Bool
+  intent "上流の応答の解釈をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  if parsed_body(&"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: b\r\n\r\nhello", false, 100) != "hello" {
+    return fail(&"respparse: Content-Length");
+  }
+  if parsed_body(&"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhello", false, 100) != "hel" {
+    return fail(&"respparse: Content-Length より後ろは捨てる");
+  }
+  if parsed_body(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-T: 1\r\n\r\n", false, 100) != "abcde" {
+    return fail(&"respparse: チャンク");
+  }
+  if parsed_body(&"HTTP/1.0 200 OK\r\n\r\nuntil-close", false, 100) != "until-close" {
+    return fail(&"respparse: 接続の切断まで");
+  }
+  if parsed_body(&"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", true, 100) != "" {
+    return fail(&"respparse: HEAD は本文なし");
+  }
+  if parsed_status(&"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n", false, 100) != 304 {
+    return fail(&"respparse: 304");
+  }
+  if parsed_body(&"HTTP/1.1 204 No Content\r\n\r\n", false, 100) != "" {
+    return fail(&"respparse: 204 は本文なし");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", false, 100) != 0 - 1 {
+    return fail(&"respparse: Content-Length と Transfer-Encoding の併記は拒否");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!", false, 100) != 0 - 1 {
+    return fail(&"respparse: 食い違う Content-Length は拒否");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello", false, 100) != 200 {
+    return fail(&"respparse: 同じ値の重複は受け入れる");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", false, 100) != 0 - 1 {
+    return fail(&"respparse: 途中で切れた本文は拒否");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\nx", false, 100) != 0 - 1 {
+    return fail(&"respparse: 上限を超える Content-Length は拒否");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n", false, 100) != 0 - 1 {
+    return fail(&"respparse: 終わりのチャンクが無いものは拒否");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nxx", false, 100) != 0 - 1 {
+    return fail(&"respparse: 未対応の転送符号は拒否");
+  }
+  if parsed_status(&"HTTP/1.1 100 Continue\r\n\r\n", false, 100) != 0 - 1 {
+    return fail(&"respparse: 1xx は拒否");
+  }
+  if parsed_status(&"garbage\r\n\r\n", false, 100) != 0 - 1 {
+    return fail(&"respparse: 状態行が不正");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\n folded: x\r\nContent-Length: 0\r\n\r\n", false, 100) != 0 - 1 {
+    return fail(&"respparse: 折り返しのヘッダは拒否");
+  }
+  if parsed_status(&"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n", false, 100) != 0 - 1 {
+    return fail(&"respparse: 先頭が終わっていないものは拒否");
+  }
+  return true;
+}
+
+pub fn run_conditional_tests() -> Bool
+  intent "条件付き GET の検証子をテストする"
+  requires none
+  ensures none
+  effects console
+{
+  let d = http_date(784111777);
+  if d.to_string_utf8().unwrap_or("") != "Sun, 06 Nov 1994 08:49:37 GMT" {
+    return fail(&"conditional: http_date");
+  }
+  if parse_http_date(&d).unwrap_or(0) != 784111777 {
+    return fail(&"conditional: parse_http_date");
+  }
+  if parse_http_date(&"Sunday, 06-Nov-94 08:49:37 GMT".as_bytes()).is_some() {
+    return fail(&"conditional: 古い日付形式は受け付けない");
+  }
+  if http_date(0).to_string_utf8().unwrap_or("") != "Thu, 01 Jan 1970 00:00:00 GMT" {
+    return fail(&"conditional: epoch");
+  }
+  let tag = etag(255, 16);
+  if tag.to_string_utf8().unwrap_or("") != "\"ff-10\"" {
+    return fail(&"conditional: etag");
+  }
+  if !not_modified(&Some("\"zz\", W/\"ff-10\"".as_bytes()), &None, &tag, 5) {
+    return fail(&"conditional: If-None-Match 一致（弱い比較）");
+  }
+  if !not_modified(&Some("*".as_bytes()), &None, &tag, 5) {
+    return fail(&"conditional: If-None-Match *");
+  }
+  if not_modified(&Some("\"other\"".as_bytes()), &None, &tag, 5) {
+    return fail(&"conditional: If-None-Match 不一致");
+  }
+  if not_modified(&Some("\"other\"".as_bytes()), &Some(d.clone()), &tag, 5) {
+    return fail(&"conditional: If-None-Match があれば If-Modified-Since は見ない");
+  }
+  if !not_modified(&None, &Some(d.clone()), &tag, 784111777) {
+    return fail(&"conditional: If-Modified-Since 同時刻");
+  }
+  if not_modified(&None, &Some(d.clone()), &tag, 784111778) {
+    return fail(&"conditional: If-Modified-Since より新しい");
+  }
+  if not_modified(&None, &Some("garbage".as_bytes()), &tag, 1) {
+    return fail(&"conditional: 読めない日付は無視して 200");
+  }
+  if not_modified(&None, &None, &tag, 1) {
+    return fail(&"conditional: 条件なし");
+  }
+  return true;
+}
+
+fn config_ok(json_text: &String) -> Bool
+  intent "設定を読めるか"
+  requires none
+  ensures none
+  effects none
+{
+  return parse_settings(&json_text.as_bytes()).is_ok();
+}
+
+pub fn run_routes_tests() -> Bool
+  intent "JSON 設定と経路の振り分けをテストする"
+  requires none
+  ensures none
+  effects console
+{
+  let good = "{\"listen\":\"127.0.0.1:8080\",\"trusted_proxies\":[\"10.0.0.0/8\",\"::1\"],\"connect_timeout_ms\":500,\"read_timeout_ms\":2000,\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/srv/www\"},{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:9000\",\"[::1]:9001\"],\"host\":\"backend\"},{\"prefix\":\"/api/v2/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:9002\"]}]}";
+  match parse_settings(&good.as_bytes()) {
+    Err(_) => {
+      return fail(&"routes: 正しい設定を読めない");
+    }
+    Ok(s) => {
+      if s.connect_ms != 500 || s.read_ms != 2000 || s.trusted.len() != 2 || s.routes.len() != 3 {
+        return fail(&"routes: 値");
+      }
+      let first = match s.routes.get(0) {
+        Some(r) => r.prefix.clone(),
+        None => "",
+      };
+      if first != "/api/v2/" {
+        return fail(&"routes: 長い接頭辞が先");
+      }
+      if find_route(&s, &"/api/v2/x".as_bytes()).unwrap_or(99) != 0 {
+        return fail(&"routes: 最長一致");
+      }
+      if find_route(&s, &"/api/v1".as_bytes()).unwrap_or(99) != 1 {
+        return fail(&"routes: /api/ に一致");
+      }
+      if find_route(&s, &"/index.html".as_bytes()).unwrap_or(99) != 2 {
+        return fail(&"routes: / に一致");
+      }
+      if find_route(&s, &"/api".as_bytes()).unwrap_or(99) != 2 {
+        return fail(&"routes: /api は / へ");
+      }
+      match s.routes.get(1) {
+        None => {
+          return fail(&"routes: 経路なし");
+        }
+        Some(r) => {
+          if r.backends.len() != 2 || !r.proxy {
+            return fail(&"routes: 転送先");
+          }
+        }
+      }
+    }
+  }
+  if config_ok(&"not json") {
+    return fail(&"routes: JSON でない");
+  }
+  if config_ok(&"{\"routes\":[]}") {
+    return fail(&"routes: 経路が空");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}],\"extra\":1}") {
+    return fail(&"routes: 不明なキー");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"},{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/b\"}]}") {
+    return fail(&"routes: 重複した接頭辞");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"api\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 接頭辞の形");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/a/../\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 接頭辞に ..");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"localhost:9000\"]}]}") {
+    return fail(&"routes: ホスト名の転送先は拒否（名前解決なし）");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[]}]}") {
+    return fail(&"routes: 転送先が空");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:0\"]}]}") {
+    return fail(&"routes: ポート 0");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:9000\"],\"host\":\"x\"}]}") {
+    return fail(&"routes: host の値");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"static\"}]}") {
+    return fail(&"routes: root なし");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\",\"backends\":[\"127.0.0.1:1\"]}]}") {
+    return fail(&"routes: static に backends");
+  }
+  if config_ok(&"{\"routes\":[{\"prefix\":\"/\",\"type\":\"cgi\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: type の値");
+  }
+  if config_ok(&"{\"connect_timeout_ms\":0,\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 接続のタイムアウト 0");
+  }
+  if config_ok(&"{\"read_timeout_ms\":300001,\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 読み取りのタイムアウトの上限");
+  }
+  if config_ok(&"{\"max_response_body\":67108865,\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 応答本文の上限");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"10.0.0.0/33\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: CIDR の範囲");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"fe80::/10\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: IPv6 の CIDR は未対応で拒否");
+  }
+  if config_ok(&"{\"trusted_proxies\":[\"proxy.example\"],\"routes\":[{\"prefix\":\"/\",\"type\":\"static\",\"root\":\"/a\"}]}") {
+    return fail(&"routes: 信頼する接続元にホスト名");
+  }
+  return true;
+}
+
+pub fn run_forward_tests() -> Bool
+  intent "上流へ送る要求の組み立てとラウンドロビンをテストする"
+  requires none
+  ensures none
+  effects console, task.share, task.suspend
+{
+  let parsed = parse_settings(&"{\"routes\":[{\"prefix\":\"/api/\",\"type\":\"proxy\",\"backends\":[\"127.0.0.1:9000\",\"127.0.0.1:9001\"]}]}".as_bytes());
+  if parsed.is_err() {
+    return fail(&"forward: 設定");
+  }
+  let settings = parsed.unwrap_or(single_static(&"/"));
+  let head = "POST /api/items?x=1&y=2 HTTP/1.1\r\nHost: client.test\r\nContent-Length: 4\r\nConnection: close, x-secret\r\nX-Secret: s\r\nX-Forwarded-For: 6.6.6.6\r\nX-Real-IP: 6.6.6.6\r\nForwarded: for=6.6.6.6\r\nX-Keep: k";
+  match make_raw_request(&head, &"data".as_bytes()) {
+    None => {
+      return fail(&"forward: 要求を作れない");
+    }
+    Some(req) => {
+      match settings.routes.get(0) {
+        None => {
+          return fail(&"forward: 経路");
+        }
+        Some(route) => {
+          match route.backends.get(0) {
+            None => {
+              return fail(&"forward: 転送先");
+            }
+            Some(b) => {
+              let src = source(false, &Some("203.0.113.9"));
+              match build_request(&req, &src, &route, &b) {
+                None => {
+                  return fail(&"forward: 組み立てられない");
+                }
+                Some(wire) => {
+                  if !starts_with_at(&wire, 0, &"POST /api/items?x=1&y=2 HTTP/1.1\r\n".as_bytes()) {
+                    return fail(&"forward: 要求行");
+                  }
+                  if !has_text(&wire, &"\r\nhost: client.test\r\n") || !has_text(&wire, &"\r\nx-forwarded-for: 203.0.113.9\r\n") || !has_text(&wire, &"\r\nx-forwarded-proto: http\r\n") {
+                    return fail(&"forward: Host / X-Forwarded-*");
+                  }
+                  if !has_text(&wire, &"\r\ncontent-length: 4\r\n") || !has_text(&wire, &"\r\nconnection: close\r\n\r\ndata") || !has_text(&wire, &"\r\nx-keep: k\r\n") {
+                    return fail(&"forward: 本文・Connection");
+                  }
+                  if has_text(&wire, &"6.6.6.6") || has_text(&wire, &"x-secret") || has_text(&wire, &"x-real-ip") || has_text(&wire, &"forwarded: for") {
+                    return fail(&"forward: 偽装・名指しされたヘッダが残っている");
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  let cursors = Lock.new(initial_cursors(2));
+  let a = next_backend(&cursors, 0, 2);
+  let b = next_backend(&cursors, 0, 2);
+  let c = next_backend(&cursors, 0, 2);
+  let other = next_backend(&cursors, 1, 3);
+  if a != 0 || b != 1 || c != 0 || other != 0 {
+    return fail(&"forward: ラウンドロビン");
+  }
+  let cloned = cursors.clone();
+  if next_backend(&cloned, 0, 2) != 1 {
+    return fail(&"forward: 複製した Lock でも巡回位置を共有する");
+  }
+  return true;
+}

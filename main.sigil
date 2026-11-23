@@ -2,56 +2,165 @@ module main
   targets server
   trust none
 
+use sigix.app.handle;
 use sigix.config.Config;
 use sigix.config.load_config;
-use sigix.serve.serve_request;
+use sigix.config.parse_listen;
+use sigix.proxy.initial_cursors;
+use sigix.routes.Settings;
+use sigix.routes.parse_settings;
+use sigix.routes.single_static;
+use sigix.routes.static_route;
 
-// 接続ごとの上限。応答本文の上限だけを設定で変え、ほかは既定（ADR 0020 決定 4）のまま使う。
-fn limits_for(max_body: Int) -> HttpLimits
-  intent "HttpLimits の既定に、設定された応答本文の上限だけを反映する"
-  requires 1 <= max_body && max_body <= 67108864
+// 接続ごとの上限。応答本文の上限とハンドラの時間だけを設定で変え、ほかは既定（ADR 0020 決定 4）のまま使う。
+fn limits_for(max_body: Int, handler_ms: Int) -> HttpLimits
+  intent "HttpLimits の既定に、設定された応答本文の上限とハンドラの時間だけを反映する"
+  requires 1 <= max_body && max_body <= 67108864 && 1 <= handler_ms && handler_ms <= 600000
   ensures none
   effects none
 {
-  return http.default_limits().with_response_body(max_body);
+  return http.default_limits().with_response_body(max_body).with_handler_ms(handler_ms);
 }
 
-fn serve(cfg: &Config) -> Int
-  intent "公開ルートを確認し、待ち受けて、接続ごとに別のルートで静的ファイルを配信する（終了しない）"
-  requires 1 <= cfg.max_body && cfg.max_body <= 67108864
+fn config_error(msg: &String) -> Int
+  intent "設定の誤りを標準出力へ出して、終了コード相当の 2 を返す"
+  requires none
   ensures none
-  effects clock, console, fs, net.server, task
+  effects console
 {
-  // 起動時の確認: 公開ルートを開けなければ待ち受けない（fail-closed）。
-  match fs.open_dir(&Path.new(&cfg.root)) {
+  console.log(&msg);
+  return 2;
+}
+
+// 設定ファイル（あれば）と `--root` から、経路の設定を決める。設定ファイルは 1 MiB まで。
+fn load_settings(cfg: &Config) -> Result<Settings, String>
+  intent "JSON の設定ファイル、または `--root` だけの段階 1 互換の設定を読む（不正は Err）"
+  requires none
+  ensures none
+  effects fs.read
+{
+  if cfg.config.byte_len() == 0 {
+    return Ok(single_static(&cfg.root));
+  }
+  match fs.read_bytes(&Path.new(&cfg.config), 1048576) {
     Err(_) => {
-      console.log(&"sigix: 公開ルートを開けません（--root / SIGIX_ROOT）");
-      return 2;
+      return Err("sigix: 設定ファイルを読めません（--config / SIGIX_CONFIG）");
     }
-    Ok(d) => {
-      let _ = d.close();
+    Ok(data) => {
+      let mut settings = parse_settings(&data)?;
+      if cfg.root.byte_len() > 0 {
+        let mut dup = false;
+        let mut i = 0;
+        while i < settings.routes.len() {
+          match settings.routes.get(i) {
+            None => {}
+            Some(r) => {
+              if r.prefix == "/" {
+                dup = true;
+              }
+            }
+          }
+          i = i + 1;
+        }
+        if dup {
+          return Err("sigix: --root と設定ファイルの prefix \"/\" が重複しています");
+        }
+        settings.routes.push(static_route(&"/", &cfg.root));
+      }
+      return Ok(settings);
     }
   }
-  let limits = limits_for(cfg.max_body);
-  match net.listen(&cfg.host, cfg.port, limits.backlog()) {
+}
+
+fn check_roots(settings: &Settings) -> Bool
+  intent "静的配信の公開ルートがすべて開けるか確かめる（開けなければ待ち受けない）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut i = 0;
+  while i < settings.routes.len() {
+    match settings.routes.get(i) {
+      None => {}
+      Some(r) => {
+        if !r.proxy {
+          match fs.open_dir(&Path.new(&r.root)) {
+            Err(_) => {
+              return false;
+            }
+            Ok(d) => {
+              let _ = d.close();
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn serve(cfg: &Config, settings: Settings) -> Int
+  intent "公開ルートを確認し、待ち受けて、接続ごとに別のルートで静的配信・プロキシを行う（終了しない）"
+  requires none
+  ensures none
+  effects clock, console, fs, net, task
+{
+  if !check_roots(&settings) {
+    console.log(&"sigix: 公開ルートを開けません（--root / SIGIX_ROOT / 設定ファイルの root）");
+    return 2;
+  }
+  // 優先順位: 起動引数 > 環境変数 > 設定ファイル > 既定値。
+  let mut host = cfg.host.clone();
+  let mut port = cfg.port;
+  if !cfg.listen_set {
+    match settings.listen.clone() {
+      None => {}
+      Some(text) => {
+        match parse_listen(&text) {
+          None => {}
+          Some(l) => {
+            host = l.host.clone();
+            port = l.port;
+          }
+        }
+      }
+    }
+  }
+  let mut max_body = cfg.max_body;
+  if !cfg.max_set {
+    match settings.max_body {
+      None => {}
+      Some(v) => {
+        max_body = v;
+      }
+    }
+  }
+  let handler_ms = settings.connect_ms + settings.read_ms + 5000;
+  let limits = limits_for(max_body, handler_ms);
+  match net.listen(&host, port, limits.backlog()) {
     Err(_) => {
       console.log(&"sigix: 待ち受けできません（--listen / SIGIX_LISTEN）");
       return 3;
     }
     Ok(listener) => {
-      let root = cfg.root.clone();
-      let max_body = cfg.max_body;
+      let cursors = Lock.new(initial_cursors(settings.routes.len()));
+      let shared = SyncShared.new(settings);
       return task.roots(limits.conns(), |g| {
         while true {
           let slot = g.reserve();
           match listener.accept() {
             Ok(stream) => {
               let conn = http.conn(stream);
-              let root_c = root.clone();
+              let shared_c = shared.clone();
+              let cursors_c = cursors.clone();
               slot.start(conn, move |c| {
-                http.serve_conn(&c, &limits_for(max_body), |req| serve_request(&root_c, max_body, &req));
+                http.serve_conn(&c, &limits_for(max_body, handler_ms), |req| {
+                  let st = shared_c.borrow();
+                  return handle(&st, &cursors_c, max_body, &req);
+                });
               }, move |c| {
-                http.abort_conn(c, &limits_for(max_body));
+                http.abort_conn(c, &limits_for(max_body, handler_ms));
               });
             }
             Err(_) => {}
@@ -69,7 +178,7 @@ pub fn main(args: List<String>) -> Int
   intent "設定を読み（不正なら終了コード 2 で即座に終わる）、静的ファイル配信サーバーを起動する"
   requires none
   ensures none
-  effects clock, console, env, fs, net.server, task
+  effects clock, console, env, fs, net, task
 {
   match load_config(&args) {
     Err(msg) => {
@@ -77,7 +186,10 @@ pub fn main(args: List<String>) -> Int
       return 2;
     }
     Ok(cfg) => {
-      return serve(&cfg);
+      return match load_settings(&cfg) {
+        Err(msg) => config_error(&msg),
+        Ok(settings) => serve(&cfg, settings),
+      };
     }
   }
 }

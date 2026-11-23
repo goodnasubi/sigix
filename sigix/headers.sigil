@@ -1,0 +1,327 @@
+module sigix.headers
+  targets server
+  trust none
+
+use sigix.text.eq_ignore_case;
+use sigix.text.lower_bytes;
+use sigix.text.split_commas;
+
+// プロキシのヘッダ書き換え（ADR 0056 決定 6）。要求を上流へ送るとき、応答をクライアントへ返すときの
+// 両方で、ホップバイホップのヘッダと、`Connection` が名指しするヘッダを必ず取り除く。
+
+pub struct Hdr {
+  name: String,
+  value: Bytes,
+}
+
+pub fn hdr(name: &String, value: &Bytes) -> Hdr
+  intent "ヘッダ 1 つを作る（名前は呼び出し側が小文字にそろえる）"
+  requires none
+  ensures none
+  effects none
+{
+  return Hdr { name: name.clone(), value: value.clone() };
+}
+
+pub enum HostMode {
+  Preserve,
+  Upstream,
+}
+
+// 接続元の扱い。`trusted` は許可リストに一致したときだけ true。`peer` は直前の接続元の IP（不明なら None）。
+pub struct Source {
+  trusted: Bool,
+  peer: Option<String>,
+}
+
+pub fn source(trusted: Bool, peer: &Option<String>) -> Source
+  intent "接続元の扱いを作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Source { trusted: trusted, peer: peer.clone() };
+}
+
+fn is_hop_by_hop(lname: &String) -> Bool
+  intent "RFC 7230 §6.1 のホップバイホップのヘッダ名か（小文字の名前で照合する）"
+  requires none
+  ensures none
+  effects none
+{
+  return lname == "connection" || lname == "keep-alive" || lname == "proxy-authenticate" || lname == "proxy-authorization" || lname == "proxy-connection" || lname == "te" || lname == "trailer" || lname == "transfer-encoding" || lname == "upgrade";
+}
+
+// 要求側で sigix が自分で付け直すヘッダ（届いた値は使わない）。
+fn is_rewritten(lname: &String) -> Bool
+  intent "上流へ渡すとき sigix が付け直す（届いた値を捨てる）ヘッダ名か"
+  requires none
+  ensures none
+  effects none
+{
+  return lname == "host" || lname == "content-length" || lname == "expect" || lname == "forwarded" || lname == "x-real-ip" || lname == "x-forwarded-for" || lname == "x-forwarded-proto" || lname == "x-forwarded-host" || lname == "x-forwarded-port";
+}
+
+// `Connection` ヘッダの値（複数あれば全部）が名指しする小文字のヘッダ名の一覧。
+fn connection_names(headers: &List<Hdr>) -> List<String>
+  intent "Connection ヘッダが名指しするヘッダ名（小文字）の一覧を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut names = List.new();
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      None => {}
+      Some(h) => {
+        if h.name == "connection" {
+          let parts = split_commas(&h.value);
+          let mut j = 0;
+          while j < parts.len() {
+            match parts.get(j) {
+              None => {}
+              Some(p) => {
+                names.push(lower_bytes(&p).to_string_utf8().unwrap_or(""));
+              }
+            }
+            j = j + 1;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return names;
+}
+
+fn listed(names: &List<String>, lname: &String) -> Bool
+  intent "名前の一覧に lname が含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(n) => {
+        if n == lname {
+          return true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ヘッダの値に入れてはならないバイト（CR・LF・NUL・その他の制御文字。HTAB は可）。
+pub fn clean_value(v: &Bytes) -> Bool
+  intent "ヘッダの値が、行を壊す制御文字を含まないか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < v.byte_len() {
+    let c = v.get(i).unwrap_or(0);
+    if (c < 32 && c != 9) || c == 127 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ヘッダ名として許す文字（RFC 7230 の token のうち、英数字と `-` `_` だけ。小文字にそろえて持つ）。
+pub fn clean_name(n: &String) -> Bool
+  intent "ヘッダ名が空でなく、英数字・ハイフン・下線だけか"
+  requires none
+  ensures none
+  effects none
+{
+  let b = n.as_bytes();
+  if b.byte_len() == 0 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    let ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 45 || c == 95;
+    if !ok {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn header_value(headers: &List<Hdr>, lname: &String) -> Option<Bytes>
+  intent "小文字の名前に一致する最初のヘッダの値（複数あれば ', ' で連結しない。先頭の 1 つ）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      None => {}
+      Some(h) => {
+        if h.name == lname {
+          return Some(h.value.clone());
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn joined_values(headers: &List<Hdr>, lname: &String) -> Option<Bytes>
+  intent "同じ名前のヘッダを全部、', ' でつないだ値（無ければ None）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut found = false;
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      None => {}
+      Some(h) => {
+        if h.name == lname {
+          if found {
+            out.push(44);
+            out.push(32);
+          }
+          out.extend(&h.value);
+          found = true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if found {
+    return Some(out);
+  }
+  return None;
+}
+
+fn push_hdr(out: &mut List<Hdr>, name: &String, value: &Bytes)
+  intent "ヘッダを 1 つ足す"
+  requires none
+  ensures none
+  effects none
+{
+  out.push(Hdr { name: name.clone(), value: value.clone() });
+}
+
+// 上流へ送る要求のヘッダ一覧を作る。
+// - ホップバイホップと、Connection が名指しするヘッダは取り除く。
+// - Host は設定により、届いた値を保つか、転送先の `ホスト:ポート` に書き換える。
+// - 許可リスト外の接続元（または接続元が不明）が送ってきた Forwarded / X-Real-IP / X-Forwarded-* は捨てる。
+//   許可リストの接続元からのものは X-Forwarded-For に直前の接続元 IP を追記し、X-Forwarded-Proto は中継する。
+// - X-Forwarded-Proto は、信頼しない接続元には常に `http`（sigix への接続は平文）で上書きする。
+pub fn upstream_headers(req: &List<Hdr>, src: &Source, mode: &HostMode, backend_host: &String) -> List<Hdr>
+  intent "要求のヘッダから、上流へ送るヘッダの一覧を作る（ホップバイホップの剥離・Host と X-Forwarded-* の組み直し）"
+  requires none
+  ensures none
+  effects none
+{
+  let named = connection_names(&req);
+  let mut out = List.new();
+  let mut i = 0;
+  while i < req.len() {
+    match req.get(i) {
+      None => {}
+      Some(h) => {
+        if !is_hop_by_hop(&h.name) && !is_rewritten(&h.name) && !listed(&named, &h.name) && clean_name(&h.name) && clean_value(&h.value) {
+          push_hdr(&mut out, &h.name, &h.value);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  // Host
+  match mode {
+    HostMode.Upstream => {
+      push_hdr(&mut out, &"host", &backend_host.as_bytes());
+    }
+    HostMode.Preserve => {
+      match header_value(&req, &"host") {
+        Some(v) => {
+          if clean_value(&v) {
+            push_hdr(&mut out, &"host", &v);
+          } else {
+            push_hdr(&mut out, &"host", &backend_host.as_bytes());
+          }
+        }
+        None => {
+          push_hdr(&mut out, &"host", &backend_host.as_bytes());
+        }
+      }
+    }
+  }
+  // X-Forwarded-For
+  match src.peer {
+    Some(ip) => {
+      let mut chain = Bytes.new();
+      if src.trusted {
+        match joined_values(&req, &"x-forwarded-for") {
+          Some(prev) => {
+            if clean_value(&prev) {
+              chain.extend(&prev);
+              chain.push(44);
+              chain.push(32);
+            }
+          }
+          None => {}
+        }
+      }
+      chain.extend(&ip.as_bytes());
+      push_hdr(&mut out, &"x-forwarded-for", &chain);
+    }
+    None => {}
+  }
+  // X-Forwarded-Proto
+  let mut proto = "http".as_bytes();
+  if src.trusted {
+    match header_value(&req, &"x-forwarded-proto") {
+      Some(v) => {
+        if eq_ignore_case(&v, &"https".as_bytes()) {
+          proto = "https".as_bytes();
+        }
+      }
+      None => {}
+    }
+  }
+  push_hdr(&mut out, &"x-forwarded-proto", &proto);
+  return out;
+}
+
+// 上流の応答のヘッダから、クライアントへ返すヘッダの一覧を作る。ホップバイホップ・Connection が名指しするもの、
+// 本文の長さを決めるもの（Content-Length は std.http が付ける）を取り除く。
+pub fn client_headers(res: &List<Hdr>) -> List<Hdr>
+  intent "上流の応答のヘッダから、クライアントへ返すヘッダの一覧を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let named = connection_names(&res);
+  let mut out = List.new();
+  let mut i = 0;
+  while i < res.len() {
+    match res.get(i) {
+      None => {}
+      Some(h) => {
+        if !is_hop_by_hop(&h.name) && h.name != "content-length" && !listed(&named, &h.name) && clean_name(&h.name) && clean_value(&h.value) {
+          push_hdr(&mut out, &h.name, &h.value);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}

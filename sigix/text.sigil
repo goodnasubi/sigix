@@ -1,0 +1,264 @@
+module sigix.text
+  targets server
+  trust none
+
+// バイト列の小さな道具（ヘッダの照合・数値の読み書き）。プロキシの各部品が共有する。
+
+pub fn lower_byte(c: Int) -> Int
+  intent "ASCII の英大文字を小文字にする（それ以外はそのまま）"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 65 && c <= 90 {
+    return c + 32;
+  }
+  return c;
+}
+
+pub fn lower_bytes(b: &Bytes) -> Bytes
+  intent "バイト列の ASCII 英大文字を小文字にした複製を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.byte_len() {
+    out.push(lower_byte(b.get(i).unwrap_or(0)));
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn lower_string(s: &String) -> String
+  intent "文字列の ASCII 英大文字を小文字にした複製を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return lower_bytes(&s.as_bytes()).to_string_utf8().unwrap_or("");
+}
+
+pub fn sub(b: &Bytes, start: Int, end: Int) -> Bytes
+  intent "範囲 [start, end) の複製（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  if start < 0 || end > b.byte_len() || start >= end {
+    return Bytes.new();
+  }
+  return b.slice(start, end).unwrap_or(Bytes.new());
+}
+
+pub fn starts_with_at(hay: &Bytes, at: Int, needle: &Bytes) -> Bool
+  intent "hay の at 番目から needle が続くか"
+  requires none
+  ensures none
+  effects none
+{
+  if at < 0 || at + needle.byte_len() > hay.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < needle.byte_len() {
+    if hay.get(at + i).unwrap_or(0) != needle.get(i).unwrap_or(1) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// from 番目以降で最初に needle が現れる位置。無ければ -1。
+pub fn find_from(hay: &Bytes, needle: &Bytes, from: Int) -> Int
+  intent "hay の from 番目以降で、最初に needle が現れる位置を返す（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let n = needle.byte_len();
+  if n == 0 {
+    return -1;
+  }
+  let mut i = from;
+  if i < 0 {
+    i = 0;
+  }
+  let last = hay.byte_len() - n;
+  let first = needle.get(0).unwrap_or(0);
+  while i <= last {
+    if hay.get(i).unwrap_or(0) == first && starts_with_at(&hay, i, &needle) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+pub fn eq_ignore_case(a: &Bytes, b: &Bytes) -> Bool
+  intent "ASCII の大文字小文字を無視して等しいか"
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    if lower_byte(a.get(i).unwrap_or(0)) != lower_byte(b.get(i).unwrap_or(1)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn is_ows(c: Int) -> Bool
+  intent "空白（SP・HTAB）か"
+  requires none
+  ensures none
+  effects none
+{
+  return c == 32 || c == 9;
+}
+
+pub fn trim_ows(b: &Bytes) -> Bytes
+  intent "前後の空白（SP・HTAB）を除いた複製を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut start = 0;
+  let mut end = b.byte_len();
+  while start < end && is_ows(b.get(start).unwrap_or(0)) {
+    start = start + 1;
+  }
+  while end > start && is_ows(b.get(end - 1).unwrap_or(0)) {
+    end = end - 1;
+  }
+  return sub(&b, start, end);
+}
+
+// カンマ区切りの要素（前後の空白を除き、空の要素は捨てる）。
+pub fn split_commas(b: &Bytes) -> List<Bytes>
+  intent "カンマで区切った要素の一覧（前後の空白を除き、空の要素は捨てる）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut start = 0;
+  let mut i = 0;
+  while i <= b.byte_len() {
+    if i == b.byte_len() || b.get(i).unwrap_or(0) == 44 {
+      let part = trim_ows(&sub(&b, start, i));
+      if part.byte_len() > 0 {
+        out.push(part);
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 10 進の数字だけのバイト列を非負の整数にする。空・数字以外・桁あふれは None。
+pub fn parse_dec(b: &Bytes) -> Option<Int>
+  intent "数字だけの 10 進の並びを非負の整数にする（空・数字以外・桁あふれは None）"
+  requires none
+  ensures none
+  effects none
+{
+  if b.byte_len() == 0 || b.byte_len() > 18 {
+    return None;
+  }
+  let mut n = 0;
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if c < 48 || c > 57 {
+      return None;
+    }
+    n = n * 10 + (c - 48);
+    i = i + 1;
+  }
+  return Some(n);
+}
+
+pub fn hex_value(c: Int) -> Int
+  intent "16 進の 1 桁の値（16 進でなければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return c - 48;
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87;
+  }
+  if c >= 65 && c <= 70 {
+    return c - 55;
+  }
+  return -1;
+}
+
+pub fn decimal(n: Int) -> Bytes
+  intent "0 以上の整数を 10 進のバイト列にする（負は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  if n <= 0 {
+    let mut zero = Bytes.new();
+    zero.push(48);
+    return zero;
+  }
+  let mut rev = Bytes.new();
+  let mut rest = n;
+  while rest > 0 {
+    rev.push(48 + rest % 10);
+    rest = rest / 10;
+  }
+  let mut out = Bytes.new();
+  let mut i = rev.byte_len();
+  while i > 0 {
+    i = i - 1;
+    out.push(rev.get(i).unwrap_or(48));
+  }
+  return out;
+}
+
+pub fn hex(n: Int) -> Bytes
+  intent "0 以上の整数を小文字の 16 進のバイト列にする（負は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  if n <= 0 {
+    let mut zero = Bytes.new();
+    zero.push(48);
+    return zero;
+  }
+  let mut rev = Bytes.new();
+  let mut rest = n;
+  while rest > 0 {
+    let d = rest % 16;
+    if d < 10 {
+      rev.push(48 + d);
+    } else {
+      rev.push(87 + d);
+    }
+    rest = rest / 16;
+  }
+  let mut out = Bytes.new();
+  let mut i = rev.byte_len();
+  while i > 0 {
+    i = i - 1;
+    out.push(rev.get(i).unwrap_or(48));
+  }
+  return out;
+}

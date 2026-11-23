@@ -67,3 +67,25 @@ pub fn fail(name: &String) -> Bool
   console.log(&name);
   return false;
 }
+
+// ヘッダ付きの要求を `std.http` の解釈器に通して作る（extra はヘッダ行の並び。各行の末尾に CRLF を付けて渡す）。
+pub fn make_raw_request(head: &String, body: &Bytes) -> Option<HttpRequest>
+  intent "要求の先頭（要求行とヘッダ。空行は含めない）と本文から、要求を解釈して作る。解釈に失敗したら None"
+  requires none
+  ensures none
+  effects none
+{
+  let mut wire = Bytes.new();
+  wire.extend(&head.as_bytes());
+  wire.extend(&"\r\n\r\n".as_bytes());
+  wire.extend(&body);
+  let limits = http.default_limits();
+  let mut parser = http.parser(&limits);
+  return match parser.feed(&wire, 0) {
+    Ok(progress) => match progress {
+      HttpProgress.Done(req, _) => Some(req),
+      HttpProgress.NeedMore => None,
+    },
+    Err(_) => None,
+  };
+}
